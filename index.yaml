@@ -2,6 +2,25 @@ apiVersion: v1
 entries:
   agent-sandbox:
   - apiVersion: v2
+    created: "2026-10-23T06:02:29.624373798Z"
+    description: Kubernetes controller for managing agent sandboxes
+    digest: 9648417af3949ef81fe20b32e381935e15eb586c6261b445bdeb84f80f99fbba
+    home: https://github.com/kubernetes-sigs/agent-sandbox
+    keywords:
+    - agent
+    - sandbox
+    - kubernetes
+    maintainers:
+    - name: Kubernetes SIGs
+      url: https://github.com/kubernetes-sigs
+    name: agent-sandbox
+    sources:
+    - https://github.com/kubernetes-sigs/agent-sandbox
+    type: application
+    urls:
+    - https://github.com/auggie246/agent-sandbox/releases/download/agent-sandbox-1.0.7/agent-sandbox-1.0.7.tgz
+    version: 1.0.7
+  - apiVersion: v2
     created: "2026-10-23T06:01:10.896251227Z"
     description: Kubernetes controller for managing agent sandboxes
     digest: f01657e248be533227f957cc8564692f0e14517364ab006bad63e7158b94d342
@@ -58,4 +77,4 @@ entries:
     urls:
     - https://github.com/auggie246/agent-sandbox/releases/download/agent-sandbox-0.1.0/agent-sandbox-0.1.0.tgz
     version: 0.1.0
-generated: "2026-10-23T06:01:10.896260234Z"
+generated: "2026-10-23T06:02:29.624392103Z"
