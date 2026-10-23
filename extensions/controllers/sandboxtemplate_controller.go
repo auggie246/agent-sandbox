@@ -31,8 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	sandboxcontrollers "sigs.k8s.io/agent-sandbox/controllers"
-	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
+	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
 )
 
@@ -45,7 +44,6 @@ type SandboxTemplateReconciler struct {
 }
 
 //+kubebuilder:rbac:groups=extensions.agents.x-k8s.io,resources=sandboxtemplates,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=extensions.agents.x-k8s.io,resources=sandboxtemplates/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=extensions.agents.x-k8s.io,resources=sandboxtemplates/finalizers,verbs=get;update;patch
 //+kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=core,resources=events,verbs=create;patch;update
@@ -55,7 +53,7 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	logger := log.FromContext(ctx)
 
 	// 1. Fetch the SandboxTemplate
-	template := &extensionsv1alpha1.SandboxTemplate{}
+	template := &extensionsv1beta1.SandboxTemplate{}
 	if err := r.Get(ctx, req.NamespacedName, template); err != nil {
 		if k8errors.IsNotFound(err) {
 			return ctrl.Result{}, nil
@@ -65,6 +63,10 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	ctx, end := r.Tracer.StartSpan(ctx, template, "ReconcileSandboxTemplate", nil)
 	defer end()
+
+	if err := r.ensureTemplateRefHashLabel(ctx, template); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	if !template.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
@@ -76,19 +78,25 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	management := template.Spec.NetworkPolicyManagement
 	if management == "" {
-		management = extensionsv1alpha1.NetworkPolicyManagementManaged
+		management = extensionsv1beta1.NetworkPolicyManagementManaged
 	}
 
 	// 3. Handle "Unmanaged" Opt-Out
-	if management == extensionsv1alpha1.NetworkPolicyManagementUnmanaged {
-		existingNP := &networkingv1.NetworkPolicy{
-			ObjectMeta: metav1.ObjectMeta{Name: npName, Namespace: npNamespace},
-		}
-		if err := r.Delete(ctx, existingNP); err != nil && !k8errors.IsNotFound(err) {
-			logger.Error(err, "Failed to clean up unmanaged NetworkPolicy")
-			return ctrl.Result{}, err
-		} else if err == nil {
+	if management == extensionsv1beta1.NetworkPolicyManagementUnmanaged {
+		existingNP := &networkingv1.NetworkPolicy{}
+		err := r.Get(ctx, types.NamespacedName{Name: npName, Namespace: npNamespace}, existingNP)
+		if err == nil {
+			if !metav1.IsControlledBy(existingNP, template) {
+				logger.Info("Skipping deletion of NetworkPolicy not owned by template", "name", npName)
+				return ctrl.Result{}, nil
+			}
+			if err := r.Delete(ctx, existingNP); err != nil {
+				logger.Error(err, "Failed to clean up unmanaged NetworkPolicy")
+				return ctrl.Result{}, err
+			}
 			logger.Info("Deleted unmanaged NetworkPolicy", "name", existingNP.Name)
+		} else if !k8errors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("failed to get NetworkPolicy: %w", err)
 		}
 		return ctrl.Result{}, nil
 	}
@@ -101,7 +109,7 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		desiredSpec = networkingv1.NetworkPolicySpec{
 			PodSelector: metav1.LabelSelector{
 				MatchLabels: map[string]string{
-					sandboxTemplateRefHash: sandboxcontrollers.NameHash(template.Name),
+					sandboxTemplateRefHash: SandboxTemplateRefHash(template.Name),
 				},
 			},
 			PolicyTypes: []networkingv1.PolicyType{
@@ -118,6 +126,9 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	err := r.Get(ctx, types.NamespacedName{Name: npName, Namespace: npNamespace}, existingNP)
 
 	if err == nil {
+		if !metav1.IsControlledBy(existingNP, template) {
+			return ctrl.Result{}, fmt.Errorf("refusing to update NetworkPolicy %q as it is not controlled by SandboxTemplate %q", npName, template.Name)
+		}
 		// Policy exists: Semantic DeepEqual check for drift
 		if equality.Semantic.DeepEqual(existingNP.Spec, desiredSpec) {
 			return ctrl.Result{}, nil // Perfect match, O(1) efficiency.
@@ -155,12 +166,49 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	return ctrl.Result{}, nil
 }
 
+func (r *SandboxTemplateReconciler) ensureTemplateRefHashLabel(ctx context.Context, template *extensionsv1beta1.SandboxTemplate) error {
+	if !template.DeletionTimestamp.IsZero() {
+		return nil
+	}
+
+	expectedHash := SandboxTemplateRefHash(template.Name)
+	if template.Labels[sandboxTemplateRefHash] == expectedHash {
+		return nil
+	}
+
+	original := template.DeepCopy()
+	if template.Labels == nil {
+		template.Labels = make(map[string]string)
+	}
+	template.Labels[sandboxTemplateRefHash] = expectedHash
+
+	if err := r.Patch(ctx, template, client.MergeFrom(original)); err != nil {
+		return fmt.Errorf("failed to label sandbox template %q with template ref hash: %w", client.ObjectKeyFromObject(template), err)
+	}
+	return nil
+}
+
 // buildDefaultNetworkPolicySpec generates the "Secure by Default" network policy.
 func buildDefaultNetworkPolicySpec(templateName string) networkingv1.NetworkPolicySpec {
+	peers := []networkingv1.NetworkPolicyPeer{
+		{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"kubernetes.io/metadata.name": "agent-sandbox-system",
+				},
+			},
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app": "sandbox-router",
+				},
+			},
+		},
+	}
+
 	return networkingv1.NetworkPolicySpec{
 		PodSelector: metav1.LabelSelector{
 			MatchLabels: map[string]string{
-				sandboxTemplateRefHash: sandboxcontrollers.NameHash(templateName),
+				sandboxTemplateRefHash: SandboxTemplateRefHash(templateName),
 			},
 		},
 		PolicyTypes: []networkingv1.PolicyType{
@@ -170,15 +218,7 @@ func buildDefaultNetworkPolicySpec(templateName string) networkingv1.NetworkPoli
 		// 1. INGRESS: Allow traffic only from the Sandbox Router
 		Ingress: []networkingv1.NetworkPolicyIngressRule{
 			{
-				From: []networkingv1.NetworkPolicyPeer{
-					{
-						PodSelector: &metav1.LabelSelector{
-							MatchLabels: map[string]string{
-								"app": "sandbox-router",
-							},
-						},
-					},
-				},
+				From: peers,
 			},
 		},
 		// 2. EGRESS: Secure Default Configuration
@@ -204,7 +244,8 @@ func buildDefaultNetworkPolicySpec(templateName string) networkingv1.NetworkPoli
 						IPBlock: &networkingv1.IPBlock{
 							CIDR: "::/0", // IPv6 Catch-all
 							Except: []string{
-								"fc00::/7", // Block IPv6 Unique Local Addresses (Internal)
+								"fc00::/7",  // Block IPv6 Unique Local Addresses (Internal)
+								"fe80::/10", // Block IPv6 Link-Local
 							},
 						},
 					},
@@ -217,7 +258,7 @@ func buildDefaultNetworkPolicySpec(templateName string) networkingv1.NetworkPoli
 // SetupWithManager sets up the controller with the Manager.
 func (r *SandboxTemplateReconciler) SetupWithManager(mgr ctrl.Manager, concurrentWorkers int) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&extensionsv1alpha1.SandboxTemplate{}).
+		For(&extensionsv1beta1.SandboxTemplate{}).
 		Owns(&networkingv1.NetworkPolicy{}).
 		WithOptions(controller.Options{MaxConcurrentReconciles: concurrentWorkers}).
 		Complete(r)

@@ -16,11 +16,17 @@
 package metrics
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"sigs.k8s.io/agent-sandbox/internal/version"
 )
 
@@ -40,6 +46,36 @@ func TestClaimLatencyRecording(t *testing.T) {
 			ClaimStartupLatency.WithLabelValues(tc.launchType, "test-tmpl").Observe(1000)
 
 			if testutil.CollectAndCount(ClaimStartupLatency) != 1 {
+				t.Errorf("Expected 1 observation for ClaimStartupLatency")
+			}
+
+			ClaimControllerStartupLatency.Reset()
+			ClaimControllerStartupLatency.WithLabelValues(tc.launchType, "test-tmpl").Observe(1000)
+
+			if testutil.CollectAndCount(ClaimControllerStartupLatency) != 1 {
+				t.Errorf("Expected 1 observation for ClaimControllerStartupLatency")
+			}
+		})
+	}
+}
+
+func TestClientClaimLatencyRecording(t *testing.T) {
+	ctx := context.Background()
+	testCases := []struct {
+		name       string
+		launchType string
+	}{
+		{"Warm", LaunchTypeWarm},
+		{"Cold", LaunchTypeCold},
+		{"Unknown", LaunchTypeUnknown},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ClientClaimStartupLatency.Reset()
+			RecordClientClaimStartupLatency(ctx, time.Now().Add(-1*time.Second), tc.launchType, "test-tmpl")
+
+			if testutil.CollectAndCount(ClientClaimStartupLatency) != 1 {
 				t.Errorf("Expected 1 observation")
 			}
 		})
@@ -68,6 +104,21 @@ func TestSandboxCreationLatencyRecording(t *testing.T) {
 	}
 }
 
+func TestLatencyHelpersSkipNegativeDurations(t *testing.T) {
+	t.Run("claim controller startup skips future observed time", func(t *testing.T) {
+		ClaimControllerStartupLatency.Reset()
+		RecordClaimControllerStartupLatency(time.Now().Add(1*time.Second), LaunchTypeCold, "test-tmpl")
+		require.Equal(t, 0, testutil.CollectAndCount(ClaimControllerStartupLatency))
+	})
+
+	t.Run("sandbox creation skips negative duration", func(t *testing.T) {
+		SandboxCreationLatency.Reset()
+		RecordSandboxCreationLatency(-1*time.Second, "default", LaunchTypeCold, "test-tmpl")
+		require.Equal(t, 0, testutil.CollectAndCount(SandboxCreationLatency))
+	})
+
+}
+
 func TestSandboxClaimCreationRecording(t *testing.T) {
 	testCases := []struct {
 		name         string
@@ -83,7 +134,7 @@ func TestSandboxClaimCreationRecording(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			SandboxClaimCreationTotal.Reset()
-			SandboxClaimCreationTotal.WithLabelValues("default", "test-tmpl", tc.launchType, "test-pool", tc.podCondition).Inc()
+			SandboxClaimCreationTotal.WithLabelValues("default", "test-tmpl", tc.launchType, "test-pool", tc.podCondition, "unknown").Inc()
 
 			if testutil.CollectAndCount(SandboxClaimCreationTotal) != 1 {
 				t.Errorf("Expected 1 observation")
@@ -102,4 +153,25 @@ func TestBuildInfo(t *testing.T) {
 	if err := testutil.CollectAndCompare(BuildInfo, strings.NewReader(expected)); err != nil {
 		t.Errorf("BuildInfo metric mismatch: %v", err)
 	}
+}
+
+func TestStartSpanEndFuncEndsSpan(t *testing.T) {
+	// StartSpan returns an end func; if the caller never invokes it, span.End is never called and
+	// the span is never exported, a span resource leak. This mini test just proves the func closes the span.
+	exp := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+	inst := &otelInstrumenter{
+		tracer:     tp.Tracer("test"),
+		propagator: propagation.TraceContext{},
+		logger:     logr.Discard(),
+	}
+
+	_, end := inst.StartSpan(context.Background(), nil, "op", nil)
+	end()
+
+	spans := exp.GetSpans()
+	require.Len(t, spans, 1)
+	require.False(t, spans[0].EndTime.IsZero(), "end func must call span.End")
 }

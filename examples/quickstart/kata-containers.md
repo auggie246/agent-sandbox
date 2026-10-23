@@ -83,19 +83,20 @@ After completing the full setup from the main guide (including [Step 5 — Sandb
 ```bash
 # Create a test sandbox
 kubectl apply -f - <<EOF
-apiVersion: extensions.agents.x-k8s.io/v1alpha1
+apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxClaim
 metadata:
   name: isolation-test
   namespace: agent-sandbox-demo
 spec:
-  sandboxTemplateRef:
-    name: python-runtime-template
+  warmPoolRef:
+    name: python-warmpool
 EOF
 
-kubectl wait --for=condition=Ready sandbox/isolation-test --timeout=60s
+kubectl wait --for=condition=Ready sandboxclaim/isolation-test --timeout=60s
 
-POD_NAME=$(kubectl get sandbox isolation-test -o jsonpath='{.metadata.annotations.agents\.x-k8s\.io/pod-name}')
+# The backing pod shares the Sandbox name
+POD_NAME=$(kubectl get sandboxclaim isolation-test -o jsonpath='{.status.sandbox.name}')
 
 # Verify Kata runtime
 kubectl get pod $POD_NAME -o jsonpath='{.spec.runtimeClassName}'; echo

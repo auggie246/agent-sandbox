@@ -18,10 +18,14 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
+	"sync"
 	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -30,8 +34,10 @@ import (
 
 	"github.com/felixge/fgprof"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/tools/events"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/agent-sandbox/controllers"
-	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
+	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	extensionscontrollers "sigs.k8s.io/agent-sandbox/extensions/controllers"
 	"sigs.k8s.io/agent-sandbox/extensions/controllers/queue"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
@@ -39,6 +45,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	//+kubebuilder:scaffold:imports
 )
@@ -57,15 +64,35 @@ func main() {
 	var enableTracing bool
 	var enablePprof bool
 	var enablePprofDebug bool
+	var enableRESTClientMetrics bool
 	var pprofBlockProfileRate int
 	var pprofMutexProfileFraction int
 	var kubeAPIQPS float64
 	var kubeAPIBurst int
+	var apiConnections int
+	var separateWatchConnection bool
 	var sandboxConcurrentWorkers int
 	var sandboxClaimConcurrentWorkers int
 	var sandboxWarmPoolConcurrentWorkers int
 	var sandboxTemplateConcurrentWorkers int
+	var sandboxWarmPoolMaxBatchSize int
+	var sandboxWarmPoolReplenishDelay time.Duration
+	var sandboxWarmPoolMaxRefillRate float64
+	var sandboxWriteBehindWindow time.Duration
+	var sandboxClaimWarmCandidateGracePeriod time.Duration
+	var sandboxWarmPoolReadinessGracePeriod time.Duration
+	var sandboxWarmPoolUnschedulableRecheckInterval time.Duration
+	var enableWarmPoolEviction bool
+	var cacheLabelSelectors bool
 	var printVersion bool
+	var disableSandboxEvents bool
+	var disableClaimEvents bool
+	var disableClaimObservabilityAnnotations bool
+	var metricsSecureServing bool
+	var metricsCertDir string
+	var tlsMinVersion string
+	var tlsCipherSuites string
+
 	flag.BoolVar(&printVersion, "version", false, "Print version information and exit.")
 	flag.StringVar(&clusterDomain, "cluster-domain", "cluster.local", "Kubernetes cluster domain for service FQDN generation")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
@@ -81,18 +108,87 @@ func main() {
 	flag.BoolVar(&enablePprofDebug, "enable-pprof-debug", false,
 		"Enable all pprof endpoints including sensitive ones (cmdline, symbol, heap, goroutine, etc). "+
 			"Implies --enable-pprof. WARNING: May expose sensitive information and comes with performance overhead.")
+	flag.BoolVar(&enableRESTClientMetrics, "enable-rest-client-metrics", true,
+		"Enable client-go REST client metrics (request latency, DNS resolution latency, request/response sizes, "+
+			"rate limiter latency, request retries). These metrics provide visibility into Kubernetes API client health. "+
+			"Set to false to disable if the additional histogram overhead is not acceptable.")
 	flag.IntVar(&pprofBlockProfileRate, "pprof-block-profile-rate", 1000000,
 		"Block profile sampling rate for /debug/pprof/block when --enable-pprof-debug is set. "+
 			"<=0 disables; 1 samples all blocking events; >=2 sets the rate in nanoseconds (e.g. 1000000 ~= 1ms).")
 	flag.IntVar(&pprofMutexProfileFraction, "pprof-mutex-profile-fraction", 10,
 		"Mutex contention sampling rate for /debug/pprof/mutex when --enable-pprof-debug is set. "+
 			"<=0 disables; 1 samples all events; N>1 samples ~1/N events (e.g. 10 ~= 1/10, 100 ~= 1/100).")
-	flag.Float64Var(&kubeAPIQPS, "kube-api-qps", -1.0, "QPS limit for kube API client (default is -1 no rate limit-unlimited)")
-	flag.IntVar(&kubeAPIBurst, "kube-api-burst", 10, "Burst limit for kube API client")
-	flag.IntVar(&sandboxConcurrentWorkers, "sandbox-concurrent-workers", 1, "Max concurrent reconciles for the Sandbox controller")
-	flag.IntVar(&sandboxClaimConcurrentWorkers, "sandbox-claim-concurrent-workers", 1, "Max concurrent reconciles for the SandboxClaim controller")
+	flag.Float64Var(&kubeAPIQPS, "kube-api-qps", -1.0, "Client-side QPS limit for the Kubernetes API client (default: -1, no client-side rate limiting)")
+	flag.IntVar(&kubeAPIBurst, "kube-api-burst", 10, "The maximum burst for client-side throttling of the Kubernetes API client.")
+	flag.IntVar(&apiConnections, "api-connections", 1,
+		"Number of independent HTTP/2 connections to the API server for non-watch traffic (writes, uncached reads, events, leader election). "+
+			"The kube-apiserver caps concurrent in-flight requests per HTTP/2 connection (SETTINGS_MAX_CONCURRENT_STREAMS; 100 by default, "+
+			"configurable server-side via --http2-max-streams-per-connection), "+
+			"so a single connection bounds effective concurrency at the advertised limit regardless of worker count or QPS settings. "+
+			"Values > 1 shard requests round-robin across that many dedicated connections, each dialed on first use (~N x per-connection limit ceiling). "+
+			"Default 1 preserves the existing single-connection client.")
+	flag.BoolVar(&separateWatchConnection, "separate-watch-connection", false,
+		"Give the manager's informer cache (list/watch streams) a dedicated HTTP/2 connection to the API server. "+
+			"Watch events arrive on existing long-lived streams, so this isolates their frames from TCP/connection-level queuing behind "+
+			"bursts of request traffic on a shared connection (HTTP/2 stream prioritization does not help in practice). "+
+			"The per-connection cap on concurrent request streams is addressed separately by --api-connections. "+
+			"Default false preserves the existing shared-connection behavior.")
+	flag.IntVar(&sandboxConcurrentWorkers, "sandbox-concurrent-workers", 100, "Max concurrent reconciles for the Sandbox controller")
+	flag.IntVar(&sandboxClaimConcurrentWorkers, "sandbox-claim-concurrent-workers", 50, "Max concurrent reconciles for the SandboxClaim controller")
 	flag.IntVar(&sandboxWarmPoolConcurrentWorkers, "sandbox-warm-pool-concurrent-workers", 1, "Max concurrent reconciles for the SandboxWarmPool controller")
 	flag.IntVar(&sandboxTemplateConcurrentWorkers, "sandbox-template-concurrent-workers", 1, "Max concurrent reconciles for the SandboxTemplate controller")
+	flag.IntVar(&sandboxWarmPoolMaxBatchSize, "sandbox-warm-pool-max-batch-size", 300, "Max batch size for parallel sandbox creation and deletion in SandboxWarmPool controller. Default is 300. Creates advance one observed batch per watch round-trip (the expectations gate waits for a batch's add events before issuing the next), so a large pool fills in about ceil(replicas/batchSize) round-trips; raising this trades round-trips for burst size and is safe at any value under the gate.")
+	flag.DurationVar(&sandboxWarmPoolReplenishDelay, "sandbox-warm-pool-replenish-delay", 0,
+		"How long the SandboxWarmPool controller defers creating replacement sandboxes after pool members drop out of the pool "+
+			"(e.g. a burst of SandboxClaims adopting warm sandboxes), so the burst gets API server priority. "+
+			"The hold re-arms while members keep dropping. 0 (default) replenishes immediately.")
+	flag.Float64Var(&sandboxWarmPoolMaxRefillRate, "sandbox-warm-pool-max-refill-rate", 0,
+		"Max rate (sandboxes/second, per pool) at which the SandboxWarmPool controller creates replacement sandboxes, "+
+			"pacing refill into a smooth stream instead of full-deficit bursts that flood the write path and compete with claim adoption. "+
+			"Composes with --sandbox-warm-pool-replenish-delay: the delay defers the start of refill, the rate shapes its flow. "+
+			"0 (default) leaves refill unpaced (whole deficit per reconcile).")
+	flag.DurationVar(&sandboxClaimWarmCandidateGracePeriod, "sandbox-claim-warm-candidate-grace-period", extensionscontrollers.DefaultWarmCandidateGracePeriod, "How long a newly created SandboxClaim waits for a warm pool candidate to report a Pod IP before falling back to cold creation. Must be a positive duration.")
+	flag.DurationVar(&sandboxWarmPoolReadinessGracePeriod, "sandbox-warm-pool-readiness-grace-period", extensionscontrollers.DefaultWarmPoolReadinessGracePeriod, "How long a warm pool sandbox may stay non-Ready, counted from when its pod is scheduled (or from creation if it has not been), before the SandboxWarmPool controller considers it stuck and replaces it (or holds it, if its pod is unschedulable or waiting on scheduling gates). Raise this for images with long initialization. Must be a positive duration.")
+	flag.DurationVar(&sandboxWarmPoolUnschedulableRecheckInterval, "sandbox-warm-pool-unschedulable-recheck-interval", extensionscontrollers.DefaultUnschedulableRecheckInterval, "Requeue interval at which the SandboxWarmPool controller re-checks a pool holding unschedulable or scheduling-gated sandboxes past the readiness grace period. Must be a positive duration.")
+	flag.BoolVar(&enableWarmPoolEviction, "enable-warm-pool-eviction", true, "Mark pods created by a warm pool as ready-to-evict by default.")
+	flag.BoolVar(&cacheLabelSelectors, "cache-label-selectors", false,
+		"Scope the manager's Pod and Service informer caches to objects carrying the sandbox tracking label ("+
+			controllers.SandboxNameHashLabel+"). The controller only ever creates/looks up Pods and Services it "+
+			"labeled itself, so on shared or high-churn clusters this cuts informer list/watch volume, JSON decode "+
+			"CPU, and cache memory from O(cluster) to O(sandboxes). CAVEAT: externally pre-provisioned resources "+
+			"that rely on the "+sandboxv1beta1.SandboxAdoptableLabel+"=true adoption path MUST also carry the "+
+			"tracking label (value = the owning sandbox's name hash) to remain visible to the controller when "+
+			"this flag is enabled.")
+	flag.BoolVar(&disableSandboxEvents, "disable-sandbox-events", false,
+		"Disable Kubernetes Event emission from the Sandbox controller (its Eventf calls become no-ops), "+
+			"reducing API server writes during large warm-pool fills. Default false (events enabled).")
+	flag.BoolVar(&disableClaimEvents, "disable-claim-events", false,
+		"Disable Kubernetes Event emission from the SandboxClaim controller (its Eventf calls become no-ops), "+
+			"reducing API server writes during large claim bursts. Default false (events enabled).")
+	flag.BoolVar(&disableClaimObservabilityAnnotations, "disable-claim-observability-annotations", false,
+		"Skip persisting the SandboxClaim observability annotations (controller first-observed timestamp, trace context), "+
+			"removing one API write per claim. The values are still stamped on the in-memory object, so startup-latency "+
+			"metrics and trace propagation to the Sandbox keep working within the controller process. Costs the on-object "+
+			"debugging breadcrumbs and, after a controller restart, the startup-latency metric for claims first observed "+
+			"by the previous process. Default false (annotations persisted).")
+	flag.DurationVar(&sandboxWriteBehindWindow, "sandbox-write-behind-window", 0,
+		"Coalescing window for the Sandbox controller's recoverable metadata-only writes. 0 disables coalescing.")
+	flag.BoolVar(&metricsSecureServing, "metrics-secure-serving", false,
+		"Serve metrics over HTTPS instead of HTTP. When enabled without --metrics-cert-dir, "+
+			"a self-signed certificate is generated automatically. Conventional HTTPS metrics port is :8443.")
+	flag.StringVar(&metricsCertDir, "metrics-cert-dir", "",
+		"Directory containing tls.crt and tls.key for the metrics server. "+
+			"Only used when --metrics-secure-serving is enabled.")
+	flag.StringVar(&tlsMinVersion, "tls-min-version", "",
+		"Minimum TLS version for the metrics server. "+
+			"Accepted values: VersionTLS10, VersionTLS11, VersionTLS12, VersionTLS13. "+
+			"If not set, the Go default applies (TLS 1.2). "+
+			"A downstream operator can use this flag to inject the cluster TLS profile.")
+	flag.StringVar(&tlsCipherSuites, "tls-cipher-suites", "",
+		"Comma-separated list of cipher suites for the metrics server, "+
+			"using Go cipher-suite names (e.g. TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256). "+
+			"If not set, the Go default applies. TLS 1.3 cipher suites are not configurable. "+
+			"A downstream operator can use this flag to inject the cluster TLS profile.")
 	opts := zap.Options{
 		Development: false,
 	}
@@ -105,17 +201,50 @@ func main() {
 	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	if sandboxClaimWarmCandidateGracePeriod <= 0 {
+		setupLog.Error(nil, "--sandbox-claim-warm-candidate-grace-period must be a positive duration", "value", sandboxClaimWarmCandidateGracePeriod)
+		os.Exit(1)
+	}
+	if sandboxWarmPoolReadinessGracePeriod <= 0 {
+		setupLog.Error(nil, "--sandbox-warm-pool-readiness-grace-period must be a positive duration", "value", sandboxWarmPoolReadinessGracePeriod)
+		os.Exit(1)
+	}
+	if sandboxWarmPoolUnschedulableRecheckInterval <= 0 {
+		setupLog.Error(nil, "--sandbox-warm-pool-unschedulable-recheck-interval must be a positive duration", "value", sandboxWarmPoolUnschedulableRecheckInterval)
+		os.Exit(1)
+	}
 
 	setupLog.Info("Concurrency settings",
 		"sandbox", sandboxConcurrentWorkers,
 		"sandboxClaim", sandboxClaimConcurrentWorkers,
 		"sandboxWarmPool", sandboxWarmPoolConcurrentWorkers,
 		"sandboxTemplate", sandboxTemplateConcurrentWorkers,
+		"sandboxWarmPoolMaxBatchSize", sandboxWarmPoolMaxBatchSize,
 	)
 
 	// Validation checks for concurrency flags
 	if sandboxConcurrentWorkers <= 0 || sandboxClaimConcurrentWorkers <= 0 || sandboxWarmPoolConcurrentWorkers <= 0 {
 		setupLog.Error(nil, "concurrent workers must be greater than 0")
+		os.Exit(1)
+	}
+	// Validation checks for sandboxWarmPoolMaxBatchSize (maximum batch size for sandbox creation and deletion in SandboxWarmPool controller)
+	if sandboxWarmPoolMaxBatchSize <= 0 {
+		setupLog.Error(nil, "sandbox-warm-pool-max-batch-size must be greater than 0")
+		os.Exit(1)
+	}
+	// Fail fast on nonsensical refill rates: flag parsing accepts "NaN" and
+	// "+Inf", and a negative rate would silently disable pacing (the
+	// controller treats <= 0 as unpaced), which is confusing to debug.
+	if math.IsNaN(sandboxWarmPoolMaxRefillRate) || math.IsInf(sandboxWarmPoolMaxRefillRate, 0) || sandboxWarmPoolMaxRefillRate < 0 {
+		setupLog.Error(nil, "sandbox-warm-pool-max-refill-rate must be a finite value >= 0 (0 disables pacing)",
+			"value", sandboxWarmPoolMaxRefillRate)
+		os.Exit(1)
+	}
+	// 0 means "write-behind disabled"; a negative window is always a
+	// misconfiguration, so fail fast instead of silently disabling.
+	if sandboxWriteBehindWindow < 0 {
+		setupLog.Error(nil, "sandbox-write-behind-window must be >= 0 (0 disables write-behind coalescing)",
+			"value", sandboxWriteBehindWindow)
 		os.Exit(1)
 	}
 	// A logical maximum (too much will create unnecessary load on the API server)
@@ -126,6 +255,10 @@ func main() {
 
 	if kubeAPIBurst <= 0 {
 		setupLog.Error(nil, "kube-api-burst must be greater than 0")
+		os.Exit(1)
+	}
+	if apiConnections < 1 {
+		setupLog.Error(nil, "api-connections must be greater than or equal to 1")
 		os.Exit(1)
 	}
 	// Warning if the total number of workers exceeds the kube API burst limit
@@ -159,17 +292,67 @@ func main() {
 		defer cleanup()
 	}
 
+	// Register client-go REST client metrics.
+	// These metrics provide visibility into API server interactions.
+	if enableRESTClientMetrics {
+		setupLog.Info("client-go REST client metrics enabled")
+		metrics.RegisterRESTClientMetrics(
+			metrics.MetricRequestLatency,
+			metrics.MetricDNSResolutionLatency,
+			metrics.MetricRequestSize,
+			metrics.MetricResponseSize,
+			metrics.MetricRateLimiterLatency,
+			metrics.MetricRequestRetry,
+		)
+	} else {
+		setupLog.Info("client-go REST client metrics disabled (--enable-rest-client-metrics=false)")
+	}
+
 	// Importing net/http/pprof registers handlers on the global DefaultServeMux.
 	// Reset it to avoid accidentally exposing pprof via any server that uses the default mux.
 	http.DefaultServeMux = http.NewServeMux()
 
 	scheme := controllers.Scheme
 	if extensions {
-		utilruntime.Must(extensionsv1alpha1.AddToScheme(scheme))
+		utilruntime.Must(extensionsv1beta1.AddToScheme(scheme))
 	}
 
 	metricsOpts := metricsserver.Options{
 		BindAddress: metricsAddr,
+	}
+	if metricsSecureServing {
+		metricsOpts.SecureServing = true
+		if metricsCertDir != "" {
+			certPath := filepath.Join(metricsCertDir, "tls.crt")
+			keyPath := filepath.Join(metricsCertDir, "tls.key")
+			if _, err := os.Stat(certPath); err != nil {
+				setupLog.Error(err, "metrics cert not found", "path", certPath)
+				os.Exit(1)
+			}
+			if _, err := os.Stat(keyPath); err != nil {
+				setupLog.Error(err, "metrics key not found", "path", keyPath)
+				os.Exit(1)
+			}
+			metricsOpts.CertDir = metricsCertDir
+		}
+		setupLog.Info("metrics server TLS enabled (--metrics-secure-serving)")
+		metricsOpts.TLSOpts = append(metricsOpts.TLSOpts, alpnOpt)
+		tlsOpts, err := buildMetricsTLSOpts(tlsMinVersion, tlsCipherSuites)
+		if err != nil {
+			setupLog.Error(err, "invalid TLS configuration")
+			os.Exit(1)
+		}
+		if len(tlsOpts) > 0 {
+			metricsOpts.TLSOpts = append(metricsOpts.TLSOpts, tlsOpts...)
+			kv := []any{"minVersion", tlsMinVersion}
+			if tlsCipherSuites != "" && tlsMinVersion != "VersionTLS13" {
+				kv = append(kv, "cipherSuites", tlsCipherSuites)
+			}
+			setupLog.Info("TLS configuration applied to metrics server", kv...)
+		}
+	} else if metricsCertDir != "" || tlsMinVersion != "" || tlsCipherSuites != "" {
+		setupLog.Error(nil, "TLS flags require --metrics-secure-serving")
+		os.Exit(1)
 	}
 	if enablePprof || enablePprofDebug {
 		setupLog.Info("pprof enabled", "debug", enablePprofDebug)
@@ -201,7 +384,18 @@ func main() {
 			metricsOpts.ExtraHandlers["/debug/pprof/block"] = pprof.Handler("block")
 			metricsOpts.ExtraHandlers["/debug/pprof/mutex"] = pprof.Handler("mutex")
 			metricsOpts.ExtraHandlers["/debug/pprof/trace"] = http.HandlerFunc(pprof.Trace)
-			metricsOpts.ExtraHandlers["/debug/fgprof"] = fgprof.Handler()
+			// Wrap fgprof handler with mutex to reject concurrent profiling requests,
+			// aligning with pprof CPU profiling behavior.
+			var fgprofMu sync.Mutex
+			fgprofHandler := fgprof.Handler()
+			metricsOpts.ExtraHandlers["/debug/fgprof"] = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !fgprofMu.TryLock() {
+					http.Error(w, "Could not enable fgprof profiling: fgprof profiling already in use", http.StatusInternalServerError)
+					return
+				}
+				defer fgprofMu.Unlock()
+				fgprofHandler.ServeHTTP(w, r)
+			})
 		}
 	}
 
@@ -209,14 +403,49 @@ func main() {
 	restConfig.QPS = float32(kubeAPIQPS)
 	restConfig.Burst = kubeAPIBurst
 
-	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
-		Scheme:                  scheme,
-		Metrics:                 metricsOpts,
-		HealthProbeBindAddress:  probeAddr,
-		LeaderElection:          enableLeaderElection,
-		LeaderElectionNamespace: leaderElectionNamespace,
-		LeaderElectionID:        "a3317529.agent-sandbox.x-k8s.io",
-	})
+	// Optional API transport tuning (see transport.go). Order matters: the
+	// dedicated watch client must be built before configureAPIConnections
+	// installs its sharding WrapTransport on restConfig.
+	var watchHTTPClient *http.Client
+	if separateWatchConnection {
+		var err error
+		watchHTTPClient, err = newIsolatedHTTPClient(restConfig)
+		if err != nil {
+			setupLog.Error(err, "unable to build dedicated watch connection client")
+			os.Exit(1)
+		}
+		setupLog.Info("informer cache list/watch traffic separated onto a dedicated HTTP/2 connection (--separate-watch-connection)")
+	}
+	if err := configureAPIConnections(restConfig, apiConnections); err != nil {
+		setupLog.Error(err, "unable to configure API connections")
+		os.Exit(1)
+	}
+	if apiConnections > 1 {
+		setupLog.Info("API transport sharding enabled: non-watch API traffic distributed round-robin across independent HTTP/2 connections",
+			"connections", apiConnections)
+	}
+
+	mgrOpts := buildManagerOptions(scheme, metricsOpts, probeAddr, enableLeaderElection, leaderElectionNamespace)
+	// managedFields stripping, the Pod spec diet, and (optionally) the
+	// tracking-label scoping; see buildCacheOptions for the rationale.
+	cacheOpts, err := buildCacheOptions(cacheLabelSelectors)
+	if err != nil {
+		setupLog.Error(err, "unable to build cache options")
+		os.Exit(1)
+	}
+	mgrOpts.Cache = cacheOpts
+	if cacheLabelSelectors {
+		setupLog.Info("informer caches for Pods and Services scoped to the sandbox tracking label (--cache-label-selectors)",
+			"label", controllers.SandboxNameHashLabel)
+	}
+	if watchHTTPClient != nil {
+		// The manager cache builds its list/watch REST clients from this
+		// http.Client (RESTClientForConfigAndClient), bypassing restConfig's
+		// WrapTransport, so watch streams stay off the write connections.
+		mgrOpts.Cache.HTTPClient = watchHTTPClient
+	}
+
+	mgr, err := ctrl.NewManager(restConfig, mgrOpts)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
@@ -225,24 +454,86 @@ func main() {
 	// Register the custom Sandbox metric collector globally.
 	asmetrics.RegisterSandboxCollector(mgr.GetClient(), mgr.GetLogger().WithName("sandbox-collector"))
 
+	// RequeueAfter-based write deferral for the Sandbox controller's
+	// recoverable metadata-only writes. Default (0) is fully synchronous:
+	// the controller keeps its stock write path. No background goroutine is
+	// involved; the workqueue's AddAfter provides the coalescing window.
+	if sandboxWriteBehindWindow > 0 {
+		setupLog.Info("Sandbox controller write deferral enabled (--sandbox-write-behind-window)",
+			"window", sandboxWriteBehindWindow, "podPatchBound", "1s")
+	}
+
+	// Every Eventf site in the sandbox controller is nil-guarded on the
+	// recorder, so a nil recorder cleanly disables event emission.
+	var sandboxRecorder events.EventRecorder
+	if disableSandboxEvents {
+		setupLog.Info("Sandbox controller event emission disabled (--disable-sandbox-events)")
+	} else {
+		sandboxRecorder = mgr.GetEventRecorder("sandbox-controller")
+	}
+
 	if err = (&controllers.SandboxReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		Tracer:        instrumenter,
-		ClusterDomain: clusterDomain,
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		Recorder:          sandboxRecorder,
+		Tracer:            instrumenter,
+		ClusterDomain:     clusterDomain,
+		WriteBehindWindow: sandboxWriteBehindWindow,
 	}).SetupWithManager(mgr, sandboxConcurrentWorkers); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Sandbox")
 		os.Exit(1)
 	}
 
 	if extensions {
+		// Warm-pool collector lists extensionsv1beta1.SandboxWarmPoolList, whose
+		// scheme is only registered when extensions are enabled. Register here so
+		// scrapes don't fail with "no kind is registered" in non-extensions builds.
+		asmetrics.RegisterWarmPoolCollector(mgr.GetClient(), mgr.GetLogger().WithName("warmpool-collector"))
+
 		warmSandboxQueue := queue.NewSimpleSandboxQueue()
+
+		var allowedDomains []string
+		configPath := "/etc/sandbox-config/allowed-label-domains"
+		if data, err := os.ReadFile(configPath); err == nil {
+			val := strings.TrimSpace(string(data))
+			if val != "" {
+				for _, d := range strings.FieldsFunc(val, func(c rune) bool {
+					return c == ',' || c == '\n' || c == '\r'
+				}) {
+					d = strings.ToLower(strings.TrimSpace(d))
+					if d != "" {
+						allowedDomains = append(allowedDomains, d)
+					}
+				}
+			}
+		} else if !os.IsNotExist(err) {
+			setupLog.Error(err, "failed to read configuration file", "path", configPath)
+			os.Exit(1)
+		}
+
+		// Every Eventf site in the claim controller is nil-guarded on the
+		// recorder, so a nil recorder cleanly disables event emission.
+		var claimRecorder events.EventRecorder
+		if disableClaimEvents {
+			setupLog.Info("SandboxClaim controller event emission disabled (--disable-claim-events)")
+		} else {
+			claimRecorder = mgr.GetEventRecorder("sandboxclaim-controller")
+		}
+
+		if disableClaimObservabilityAnnotations {
+			setupLog.Info("SandboxClaim observability annotation persistence disabled (--disable-claim-observability-annotations)")
+		}
+
 		if err = (&extensionscontrollers.SandboxClaimReconciler{
-			Client:           mgr.GetClient(),
-			Scheme:           mgr.GetScheme(),
-			WarmSandboxQueue: warmSandboxQueue,
-			Recorder:         mgr.GetEventRecorder("sandboxclaim-controller"),
-			Tracer:           instrumenter,
+			Client:                          mgr.GetClient(),
+			APIReader:                       mgr.GetAPIReader(),
+			Scheme:                          mgr.GetScheme(),
+			WarmSandboxQueue:                warmSandboxQueue,
+			Recorder:                        claimRecorder,
+			Tracer:                          instrumenter,
+			AllowedLabelDomains:             allowedDomains,
+			DisableObservabilityAnnotations: disableClaimObservabilityAnnotations,
+			WarmCandidateGracePeriod:        sandboxClaimWarmCandidateGracePeriod,
 		}).SetupWithManager(mgr, sandboxClaimConcurrentWorkers); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "SandboxClaim")
 			os.Exit(1)
@@ -259,12 +550,20 @@ func main() {
 		}
 
 		if err = (&extensionscontrollers.SandboxWarmPoolReconciler{
-			Client: mgr.GetClient(),
-			Scheme: mgr.GetScheme(),
+			Client:                       mgr.GetClient(),
+			Scheme:                       mgr.GetScheme(),
+			MaxBatchSize:                 sandboxWarmPoolMaxBatchSize,
+			EnableWarmPoolEviction:       enableWarmPoolEviction,
+			Recorder:                     mgr.GetEventRecorder("sandboxwarmpool-controller"),
+			ReplenishDelay:               sandboxWarmPoolReplenishDelay,
+			MaxRefillRate:                sandboxWarmPoolMaxRefillRate,
+			ReadinessGracePeriod:         sandboxWarmPoolReadinessGracePeriod,
+			UnschedulableRecheckInterval: sandboxWarmPoolUnschedulableRecheckInterval,
 		}).SetupWithManager(mgr, sandboxWarmPoolConcurrentWorkers); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "SandboxWarmPool")
 			os.Exit(1)
 		}
+
 	}
 
 	//+kubebuilder:scaffold:builder

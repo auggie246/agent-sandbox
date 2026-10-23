@@ -28,17 +28,16 @@ import (
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
-	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
-	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	"sigs.k8s.io/agent-sandbox/test/e2e/framework"
 	"sigs.k8s.io/agent-sandbox/test/e2e/framework/predicates"
 	"sigs.k8s.io/yaml"
 )
 
 const sandboxManifest = `
-apiVersion: agents.x-k8s.io/v1alpha1
+apiVersion: agents.x-k8s.io/v1beta1
 kind: Sandbox
 metadata:
   name: sandbox-python-example
@@ -59,7 +58,7 @@ spec:
 `
 
 const templateManifest = `
-apiVersion: extensions.agents.x-k8s.io/v1alpha1
+apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxTemplate
 metadata:
   name: python-sandbox-template
@@ -81,17 +80,17 @@ spec:
 `
 
 const claimManifest = `
-apiVersion: extensions.agents.x-k8s.io/v1alpha1
+apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxClaim
 metadata:
   name: python-sandbox-claim
 spec:
-  sandboxTemplateRef:
-    name: python-sandbox-template
+  warmPoolRef:
+    name: python-warmpool
 `
 
 const warmPoolManifest = `
-apiVersion: extensions.agents.x-k8s.io/v1alpha1
+apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxWarmPool
 metadata:
   name: python-warmpool
@@ -101,32 +100,32 @@ spec:
     name: python-sandbox-template
 `
 
-func sandboxFromManifest(manifest string) (*sandboxv1alpha1.Sandbox, error) {
-	sandbox := &sandboxv1alpha1.Sandbox{}
+func sandboxFromManifest(manifest string) (*sandboxv1beta1.Sandbox, error) {
+	sandbox := &sandboxv1beta1.Sandbox{}
 	if err := yaml.Unmarshal([]byte(manifest), sandbox); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal Sandbox: %w", err)
 	}
 	return sandbox, nil
 }
 
-func sandboxTemplateFromManifest(manifest string) (*extensionsv1alpha1.SandboxTemplate, error) {
-	template := &extensionsv1alpha1.SandboxTemplate{}
+func sandboxTemplateFromManifest(manifest string) (*extensionsv1beta1.SandboxTemplate, error) {
+	template := &extensionsv1beta1.SandboxTemplate{}
 	if err := yaml.Unmarshal([]byte(manifest), template); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal SandboxTemplate: %w", err)
 	}
 	return template, nil
 }
 
-func sandboxClaimFromManifest(manifest string) (*extensionsv1alpha1.SandboxClaim, error) {
-	claim := &extensionsv1alpha1.SandboxClaim{}
+func sandboxClaimFromManifest(manifest string) (*extensionsv1beta1.SandboxClaim, error) {
+	claim := &extensionsv1beta1.SandboxClaim{}
 	if err := yaml.Unmarshal([]byte(manifest), claim); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal SandboxClaim: %w", err)
 	}
 	return claim, nil
 }
 
-func sandboxWarmpoolFromManifest(manifest string) (*extensionsv1alpha1.SandboxWarmPool, error) {
-	warmpool := &extensionsv1alpha1.SandboxWarmPool{}
+func sandboxWarmpoolFromManifest(manifest string) (*extensionsv1beta1.SandboxWarmPool, error) {
+	warmpool := &extensionsv1beta1.SandboxWarmPool{}
 	if err := yaml.Unmarshal([]byte(manifest), warmpool); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal SandboxWarmPool: %w", err)
 	}
@@ -212,6 +211,13 @@ func TestRunPythonRuntimeSandboxClaim(testingT *testing.T) {
 	require.NoError(testingT, err)
 	sandboxTemplate.Namespace = ns.Name
 	require.NoError(testingT, testContext.CreateWithCleanup(testingT.Context(), sandboxTemplate))
+
+	sandboxWarmpool, err := sandboxWarmpoolFromManifest(warmPoolManifest)
+	require.NoError(testingT, err)
+	sandboxWarmpool.Namespace = ns.Name
+	replicas := int32(0)
+	sandboxWarmpool.Spec.Replicas = &replicas
+	require.NoError(testingT, testContext.CreateWithCleanup(testingT.Context(), sandboxWarmpool))
 
 	// Create the sandbox claim and wait for readiness
 	sandboxClaim, err := sandboxClaimFromManifest(claimManifest)
@@ -299,16 +305,10 @@ func TestRunPythonRuntimeSandboxWarmpool(testingT *testing.T) {
 
 	require.NoError(testingT, testContext.WaitForSandboxReady(testingT.Context(), sandboxID))
 
-	// Get the Sandbox to extract the pod name
-	sandbox, err := testContext.GetSandbox(ctx, sandboxID)
+	_, err = testContext.GetSandbox(ctx, sandboxID)
 	require.NoError(testingT, err)
 
-	// The pod-name annotation is set by the sandbox controller for adopted pods.
-	// For warm pool sandboxes the pod name defaults to the sandbox name.
-	podName, _, _ := unstructured.NestedString(sandbox.Object, "metadata", "annotations", "agents.x-k8s.io/pod-name")
-	if podName == "" {
-		podName = sandboxName
-	}
+	podName := sandboxName
 	testingT.Logf("DEBUG: Using pod name: %s", podName)
 
 	podID := types.NamespacedName{
@@ -360,7 +360,6 @@ func runPodTests(ctx context.Context, testingT *testing.T, testContext *framewor
 			// Perform execute check
 			executeURL := "http://localhost:8888/execute"
 			err = checkExecute(ctx, executeURL)
-			portForwardCancel()
 
 			if err != nil {
 				testingT.Logf("failed to verify execute endpoint: %v", err)
@@ -370,8 +369,20 @@ func runPodTests(ctx context.Context, testingT *testing.T, testContext *framewor
 			}
 			testingT.Logf("Execute endpoint check successful: url - %s", executeURL)
 
-			// Both checks passed
-			testingT.Logf("Both health and execute checks passed.")
+			// Verify the health endpoint stays responsive while a
+			// long-running command is executing.
+			err = checkConcurrentExecute(ctx, executeURL, healthURL)
+			portForwardCancel()
+
+			if err != nil {
+				testingT.Logf("failed to verify concurrent execute: %v", err)
+				time.Sleep(pollDuration)
+				continue
+			}
+			testingT.Logf("Concurrent execute check successful.")
+
+			// All checks passed
+			testingT.Logf("Health, execute, and concurrent execute checks passed.")
 			return nil
 		}
 	}
@@ -449,4 +460,59 @@ func checkExecute(ctx context.Context, url string) error {
 		return fmt.Errorf("unexpected stdout in response: got %q, want %q", stdout, "hello world\n")
 	}
 	return nil
+}
+
+// checkConcurrentExecute verifies that the health endpoint stays responsive
+// while a long-running command is executing, guarding against the execute
+// endpoint blocking the server event loop.
+func checkConcurrentExecute(ctx context.Context, executeURL, healthURL string) error {
+	const sleepSeconds = 5
+
+	executeDone := make(chan error, 1)
+	go func() {
+		httpClient := &http.Client{}
+		httpClient.Timeout = (sleepSeconds + 5) * time.Second
+
+		payload := fmt.Sprintf(`{"command": "sleep %d"}`, sleepSeconds)
+		req, err := http.NewRequestWithContext(ctx, "POST", executeURL, strings.NewReader(payload))
+		if err != nil {
+			executeDone <- fmt.Errorf("failed to create HTTP request: %w", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		response, err := httpClient.Do(req)
+		if err != nil {
+			executeDone <- fmt.Errorf("error sending HTTP request to execute endpoint: %w", err)
+			return
+		}
+		defer response.Body.Close()
+
+		if response.StatusCode != http.StatusOK {
+			executeDone <- fmt.Errorf("non-200 response from execute endpoint: %d", response.StatusCode)
+			return
+		}
+		executeDone <- nil
+	}()
+
+	// Poll the health endpoint while the long-running command is in flight.
+	// checkHealth uses a short timeout, so a blocked event loop surfaces as
+	// an error here instead of the poll silently waiting out the command.
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("context cancelled")
+		case err := <-executeDone:
+			if err != nil {
+				return fmt.Errorf("long-running execute failed: %w", err)
+			}
+			return nil
+		case <-ticker.C:
+			if err := checkHealth(ctx, healthURL); err != nil {
+				return fmt.Errorf("health endpoint unresponsive during long-running execute: %w", err)
+			}
+		}
+	}
 }

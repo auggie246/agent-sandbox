@@ -23,12 +23,28 @@ class SandboxNotReadyError(SandboxError):
     """Raised when the sandbox is not ready for communication."""
 
 
+class SandboxNoServiceError(SandboxError):
+    """Raised in ``in-cluster-service`` mode if the Sandbox has no Service FQDN."""
+
+
+# Deprecated alias; use SandboxNoServiceError.
+SandboxServiceUnavailableError = SandboxNoServiceError
+
+
 class SandboxNotFoundError(SandboxError):
     """Raised when the sandbox or sandbox claim cannot be found or was deleted."""
 
 
+class SnapshotNotFoundError(SandboxError):
+    """Raised when the requested snapshot does not exist."""
+
+
 class SandboxTemplateNotFoundError(SandboxError):
     """Raised when the requested sandbox template does not exist."""
+
+
+class SandboxWarmPoolNotFoundError(SandboxError):
+    """Raised when the requested sandbox warm pool does not exist."""
 
 
 class SandboxPortForwardError(SandboxError):
@@ -53,7 +69,17 @@ class SandboxRequestError(SandboxError):
         message: str,
         status_code: int | None = None,
         response: Any = None,
-    ):
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.response = response
+
+
+class SandboxClaimFailedError(SandboxError):
+    """The SandboxClaim reported a terminal Ready=False reason.
+
+    The claim controller will not retry these (e.g. InvalidMetadata,
+    VolumeClaimTemplatesError, ClaimExpired); the claim will not become
+    ready without user action, so ready-waits raise instead of waiting
+    out the timeout.
+    """

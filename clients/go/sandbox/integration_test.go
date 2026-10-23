@@ -17,16 +17,18 @@
 package sandbox
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
 
 var (
-	templateName     = flag.String("template-name", "python-sandbox-template", "SandboxTemplate name")
-	gatewayName      = flag.String("gateway-name", "", "Gateway name for production mode")
+	warmPoolName     = flag.String("warmpool-name", "python-sandbox-warmpool", "SandboxWarmPool name")
+	gatewayName      = flag.String("gateway-name", "", "Gateway name for Gateway mode")
 	gatewayNamespace = flag.String("gateway-namespace", "", "Gateway namespace (defaults to --namespace)")
 	apiURL           = flag.String("api-url", "", "Direct API URL")
 	namespace        = flag.String("namespace", "default", "Kubernetes namespace")
@@ -44,7 +46,7 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 	}
 
 	opts := Options{
-		TemplateName:        *templateName,
+		WarmPoolName:        *warmPoolName,
 		Namespace:           *namespace,
 		GatewayName:         *gatewayName,
 		GatewayNamespace:    gwNS,
@@ -94,6 +96,32 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 		}
 		if string(data) != string(content) {
 			t.Errorf("expected %q, got %q", string(content), string(data))
+		}
+	})
+
+	t.Run("WriteReaderAndRead", func(t *testing.T) {
+		content := "This file was streamed."
+		if err := client.WriteReader(ctx, "streamed.txt", strings.NewReader(content)); err != nil {
+			t.Fatalf("WriteReader() error: %v", err)
+		}
+
+		data, err := client.Read(ctx, "streamed.txt")
+		if err != nil {
+			t.Fatalf("Read() error: %v", err)
+		}
+		if string(data) != content {
+			t.Errorf("expected %q, got %q", content, string(data))
+		}
+	})
+
+	t.Run("ReadTo", func(t *testing.T) {
+		var destination bytes.Buffer
+		written, err := client.ReadTo(ctx, "streamed.txt", &destination)
+		if err != nil {
+			t.Fatalf("ReadTo() error: %v", err)
+		}
+		if written != int64(destination.Len()) || destination.String() != "This file was streamed." {
+			t.Errorf("ReadTo() = (%d, %q), want streamed file content", written, destination.String())
 		}
 	})
 
@@ -151,7 +179,7 @@ func newIntegrationClient(t *testing.T) *Sandbox {
 		gwNS = *namespace
 	}
 	client, err := New(context.Background(), Options{
-		TemplateName:        *templateName,
+		WarmPoolName:        *warmPoolName,
 		Namespace:           *namespace,
 		GatewayName:         *gatewayName,
 		GatewayNamespace:    gwNS,

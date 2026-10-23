@@ -4,22 +4,29 @@ Agent Sandbox is a quick and easy way to start secure containers that will let a
 
 ## Prerequisites
 
-- A running Kubernetes cluster with the [Agent Sandbox Controller](/README.md/#installation) installed.
-- The [Sandbox Router](/clients/python/agentic-sandbox-client/README.md#setup-deploying-the-router) deployed in your cluster.
-- A `SandboxTemplate` named `python-sandbox-template` applied to your cluster. See the [Python Runtime Sandbox](/examples/python-runtime-sandbox/README.md) guide for setup instructions.
-- The [Python SDK](/clients/python/agentic-sandbox-client/README.md) installed: `pip install k8s-agent-sandbox`.
+- A running Kubernetes cluster with the [Agent Sandbox Controller](../../README.md#installation) installed.
+- The [Sandbox Router](../../clients/python/agentic-sandbox-client/README.md#setup-deploying-the-router) deployed in your cluster.
+- A `SandboxWarmPool` named `python-sandbox-pool` applied to your cluster, backed by a template using the [python-runtime-sandbox](../python-runtime-sandbox) image. From the repository root:
+
+  ```bash
+  export SANDBOX_NAMESPACE=default SANDBOX_TEMPLATE_NAME=python-sandbox-template SANDBOX_WARMPOOL_NAME=python-sandbox-pool
+  envsubst < clients/python/agentic-sandbox-client/python-sandbox-template.yaml | kubectl apply -f -
+  envsubst < clients/python/agentic-sandbox-client/python-sandbox-warmpool.yaml | sed 's/replicas: 0/replicas: 1/' | kubectl apply -f -
+  ```
+- The [Python SDK](../../clients/python/agentic-sandbox-client/README.md) installed: `pip install k8s-agent-sandbox`.
 
 ## Connection Modes
 
 `SandboxClient()` with no arguments defaults to **Tunnel mode** (`SandboxLocalTunnelConnectionConfig`), which opens a `kubectl port-forward` tunnel to the Router Service — no public IP required, works on KinD and Minikube.
 
-The SDK supports three modes:
+The SDK supports four modes:
 
 | Mode | Config class | When to use |
 |------|-------------|-------------|
 | **Tunnel** (default) | `SandboxLocalTunnelConnectionConfig` | Local development and CI — tunnels via `kubectl port-forward` |
 | **Gateway** | `SandboxGatewayConnectionConfig` | Production clusters with a public Kubernetes Gateway |
-| **Direct** | `SandboxDirectConnectionConfig` | In-cluster agents or custom domains, bypasses discovery entirely |
+| **Direct** | `SandboxDirectConnectionConfig` | Custom router URLs, bypasses discovery entirely |
+| **In-cluster** | `SandboxInClusterConnectionConfig` | Agents running inside the cluster |
 
 ## Usage
 
@@ -31,7 +38,7 @@ from k8s_agent_sandbox import SandboxClient
 client = SandboxClient()
 
 sandbox = client.create_sandbox(
-    template="python-sandbox-template",
+    warmpool="python-sandbox-pool",
     namespace="default",
 )
 try:
@@ -46,7 +53,7 @@ Or write a file into the sandbox filesystem, then read it:
 
 ```python
 sandbox = client.create_sandbox(
-    template="python-sandbox-template",
+    warmpool="python-sandbox-pool",
     namespace="default",
 )
 try:

@@ -43,7 +43,7 @@ This is designed for running untrusted code safely:
 
 **Ingress (Incoming Traffic)**
 
-- **Allowed:**  Traffic is only allowed from the designated [Sandbox Router](../../../clients/python/agentic-sandbox-client/sandbox-router) (`app: sandbox-router`). The router must run in the template’s namespace for the secure default to work. 
+- **Allowed:**  Traffic is only allowed from the designated [Sandbox Router](../../../clients/python/agentic-sandbox-client/sandbox-router) (`app: sandbox-router`) residing in the `"agent-sandbox-system"` system namespace.
 
 - **Blocked:** All other internal cluster traffic and external ingress is explicitly denied.
 
@@ -61,6 +61,8 @@ This is designed for running untrusted code safely:
 
   - Internal IPv6 Unique Local Addresses (`fc00::/7`).
 
+  - IPv6 Link-Local (`fe80::/10`).
+
   - Internal Cluster DNS (CoreDNS).
 
 
@@ -71,7 +73,7 @@ When you provide a custom networkPolicy block within your template, it completel
 You can override the secure defaults by defining custom rules within the `SandboxTemplate`. The schema uses standard Kubernetes `NetworkPolicyIngressRule` and `NetworkPolicyEgressRule` formats.
 
 ```yaml
-apiVersion: extensions.agents.x-k8s.io/v1alpha1
+apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxTemplate
 metadata:
   name: custom-net-template
@@ -89,7 +91,7 @@ spec:
 If you are running an agent that purely performs computation and requires absolute network isolation, you can pass empty arrays to explicitly block all traffic.
 
 ```yaml
-apiVersion: extensions.agents.x-k8s.io/v1alpha1
+apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxTemplate
 metadata:
   name: airgapped-template
@@ -105,7 +107,7 @@ spec:
 Here is a practical example of a `SandboxTemplate` configured for an AI agent that requires access to an internal database, the public internet, and incoming health checks from a monitoring namespace.
 
 ```yaml
-apiVersion: extensions.agents.x-k8s.io/v1alpha1
+apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxTemplate
 metadata:
   name: custom-agent-template
@@ -125,7 +127,10 @@ spec:
 
       # 2. Re-allow the standard Sandbox Router (required if you override defaults)
       - from:
-        - podSelector:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: agent-sandbox-system
+          podSelector:
             matchLabels:
               app: sandbox-router
 
@@ -152,6 +157,7 @@ spec:
             cidr: "::/0"
             except:
               - "fc00::/7"
+              - "fe80::/10"
 ```
 
 - Total Override: Because the Secure Defaults are replaced, we must manually re-add the rule allowing ingress from the `sandbox-router` if we still want that functionality.  
@@ -159,6 +165,168 @@ spec:
 - Granular Egress: We specify exactly which internal IP (`10.10.10.100/32`) and port (`5432`) the sandbox can access.  
 
 - Retaining Internet Access: We copy the public internet egress rules from the secure defaults to ensure the agent can still make external API calls while blocking lateral movement across the internal cluster network.
+
+
+**Example 3: GCP Workload Identity & Google Cloud Services (Vertex AI, GCS, etc.)**
+
+If your AI sandboxes interact with Google Cloud APIs (e.g., Vertex AI model generation or reading/writing data to Google Cloud Storage buckets), you must configure your network policy to support **Workload Identity** and prevent latency hangs.
+
+There are two critical gotchas to be aware of when using Google Cloud APIs inside a sandboxed environment:
+1. **Workload Identity (169.254.169.254)**: Google Cloud SDKs authenticate by querying the GCP Metadata Server at `169.254.169.254`. This link-local address is blocked by default under the Secure-by-Default posture, so you must explicitly permit it.
+2. **IPv6 / DNS**: Modern runtimes (such as Node.js clients using `fetch` or Python SDKs using libraries like `urllib3`, `requests`, or `aiohttp`) may attempt to reach Google API domains (like `aiplatform.googleapis.com` or `storage.googleapis.com`) over both IPv4 and IPv6. Because standard Kubernetes network policies are default-deny, if you omit the IPv6 egress block (`::/0`), the CNI may silently drop the outbound IPv6 packets. This can cause the application to hang for up to ~2 minutes before falling back to IPv4, depending on the runtime and network stack.
+
+To support Google Cloud APIs natively without experiencing these latency hangs or resolution failures, you must:
+1. Explicitly allow **both** IPv4 and IPv6 egress to the internet.
+2. Add a separate, narrow egress rule allowing traffic only to the GCP Metadata Server (`169.254.169.254/32` on TCP port 80) rather than leaving the entire `169.254.0.0/16` link-local range exposed.
+3. Configure custom DNS resolvers (like public Google/Cloudflare DNS) directly in the sandbox `podTemplate`. Since defining a custom `networkPolicy` disables the automatic "Secure-by-Default" DNS override, and since RFC1918 private subnets are blocked by the custom egress rules, the sandbox would be unable to reach internal cluster DNS (CoreDNS), causing DNS lookups for external domains to fail.
+
+```yaml
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: gcp-agent-template
+spec:
+  networkPolicyManagement: Managed
+  networkPolicy:
+    ingress:
+      # Re-allow the standard Sandbox Router
+      - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: agent-sandbox-system
+          podSelector:
+            matchLabels:
+              app: sandbox-router
+    egress:
+      # 1. Allow outbound IPv4 to the public internet (excluding private subnets and link-local)
+      - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+
+      # 2. Allow outbound IPv6
+      - to:
+        - ipBlock:
+            cidr: "::/0"
+            except:
+              - "fc00::/7"
+
+      # 3. Allow narrow egress to the GCP Metadata Server for Workload Identity
+      - to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+        ports:
+          - protocol: TCP
+            port: 80
+
+  podTemplate:
+    spec:
+      # Custom networkPolicies disable the automatic "Secure-by-Default" DNS override.
+      # Since private subnets are blocked above, we must configure external public resolvers
+      # here so that the sandbox can resolve public Google API domains.
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+          - 8.8.8.8
+          - 1.1.1.1
+      # ... rest of the pod template spec (containers, volumes, etc.)
+```
+
+
+**Example 4: In-cluster Service by DNS name**
+
+This template lets a sandbox call `memory-service` in the `memory` namespace by name. The Service listens on port 80 and forwards to container port 8080. The Secure-by-Default policy blocks this in two ways:
+
+- It points the pod at 8.8.8.8 and 1.1.1.1, which return NXDOMAIN for `memory-service.memory.svc.cluster.local`.
+- It blocks egress to `10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16`, where CoreDNS and the `memory-service` pods have their IPs.
+
+```yaml
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: in-cluster-service-template
+spec:
+  networkPolicyManagement: Managed
+  networkPolicy:
+    ingress:
+      # Re-allow the standard Sandbox Router
+      - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: agent-sandbox-system
+          podSelector:
+            matchLabels:
+              app: sandbox-router
+    egress:
+      # 1. DNS to CoreDNS (see the note on Service name enumeration below)
+      - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        ports:
+          - protocol: UDP
+            port: 53
+          - protocol: TCP
+            port: 53
+
+      # 2. The memory-service pods, on the container port (8080), not the Service port (80)
+      - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: memory
+          podSelector:
+            matchLabels:
+              app: memory-service
+        ports:
+          - protocol: TCP
+            port: 8080
+
+      # 3. Public internet, same excepts as the secure default
+      - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+        - ipBlock:
+            cidr: "::/0"
+            except:
+              - "fc00::/7"
+              - "fe80::/10"
+
+  podTemplate:
+    spec:
+      dnsPolicy: ClusterFirst
+      # ... rest of the pod template spec (containers, volumes, etc.)
+```
+
+- Rule 1 lets the sandbox resolve any Service name in the cluster, not just `memory-service`. Secure-by-Default points sandboxes at public resolvers so that untrusted code cannot list the cluster's Services; this rule gives that back. Rule 3 still blocks connecting to them. If that is not acceptable, keep the public resolvers and reach the target by IP as in Example 2.
+
+- `dnsPolicy: ClusterFirst` opts the pod out of the public-resolver override, which the controller applies only when `dnsPolicy` is empty. It does nothing else. If the `networkPolicy` block is removed later, the secure default blocks egress to CoreDNS and, with `ClusterFirst` set, DNS fails closed.
+
+- Port 8080 in rule 2: a `NetworkPolicyPort` is a port on the destination pod, not on the Service, so the rule needs the container port. Port 80 here would block every request. This holds for plugins that apply egress policy after the Service address is translated (GKE Dataplane V2, Calico, Cilium). A plugin that applies it before translation would need the Service port; check yours.
+
+- Selectors instead of IPs: rule 2 keeps matching when `memory-service` pods are rescheduled. Every other pod in the cluster stays blocked only if the cluster's pod and Service CIDRs fall inside the excepts in rule 3. If they do not (for example, a pod range in `100.64.0.0/10`), add those CIDRs to the `except` lists.
+
+- NodeLocal DNSCache: pods send DNS to `169.254.20.10` instead of to CoreDNS, so rule 1 does not match. Add an `ipBlock` rule for `169.254.20.10/32` on port 53.
+
+To check from inside a sandbox:
+
+```bash
+getent hosts memory-service.memory.svc.cluster.local   # prints the ClusterIP
+curl -sS -m 5 http://memory-service.memory/            # gets a response
+curl -sS -m 5 http://other-service.other-namespace/    # any other Service: times out
+```
+
 
 
 ## Troubleshooting
@@ -173,19 +341,23 @@ kubectl get networkpolicy <template-name>-network-policy -n <namespace> -o yaml
 
 **As a user, how do I determine what policies are attached to my SandboxClaim?**
 
-Look at the `SandboxTemplate` your claim references.
+Look at the `SandboxTemplate` referenced by your claim's `SandboxWarmPool`.
 
-1. Run `kubectl get sandboxtemplate <template-name> -o yaml`.
+1. Run `kubectl get sandboxwarmpool <warmpool-name> -o yaml` to find the underlying template name.
 
-2. Check the `spec.networkPolicyManagement` field.
+2. Run `kubectl get sandboxtemplate <template-name> -o yaml`.
 
-3. If it is `Managed` and `spec.networkPolicy` is empty, the Secure by Default posture is active. If `spec.networkPolicy` is populated, those exact custom rules are applied.
+3. Check the `spec.networkPolicyManagement` field.
+
+4. If it is `Managed` and `spec.networkPolicy` is empty, the Secure by Default posture is active. If `spec.networkPolicy` is populated, those exact custom rules are applied.
 
 **Will admins be able to set default policies for Layer 7 (L7)?**
 
 Not using the built-in `networkPolicy` field, as it relies on standard Kubernetes NetworkPolicies (L3/L4).
 
-However, admins can manage L7 policies by changing the template's management mode:
+For cluster-wide defaults and egress by domain name (FQDN) you still can use `Managed` mode. The [Network Policy API](https://network-policy-api.sigs.k8s.io/) `ClusterNetworkPolicy` works together with Kubernetes `NetworkPolicy`: Admin-tier rules are evaluated before the template-managed policy, `Pass` rules delegate to it, and Baseline-tier rules apply to pods that no `NetworkPolicy` selects. [examples/network-policy-api-sandbox](../../network-policy-api-sandbox/README.md) keeps the templates `Managed` and adds a default deny plus FQDN allowlists on top, using [kube-network-policies](https://kube-network-policies.sigs.k8s.io/) (the SIG Network reference implementation, which can run alongside any CNI) or any other implementation of the API. The FQDN rules use the experimental `domainNames` field, so an implementation that only supports the standard channel has to omit or replace them.
+
+For L7 inspection (HTTP paths, headers, gRPC methods) that only a CNI- or mesh-specific policy object provides, admins can change the template's management mode:
 
 ```yaml
 spec:

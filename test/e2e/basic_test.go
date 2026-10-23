@@ -17,13 +17,14 @@ package e2e
 import (
 	"fmt"
 	"hash/fnv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	"sigs.k8s.io/agent-sandbox/test/e2e/framework"
 	"sigs.k8s.io/agent-sandbox/test/e2e/framework/predicates"
 )
@@ -37,15 +38,25 @@ func NameHash(objectName string) string {
 
 	// Convert the uint32 to a hexadecimal string.
 	// This results in an 8-character string (e.g., "a5b3c2d1").
-	return fmt.Sprintf("%08x", hashValue)
+	const hex = "0123456789abcdef"
+	var buf [8]byte
+	buf[0] = hex[(hashValue>>28)&0xf]
+	buf[1] = hex[(hashValue>>24)&0xf]
+	buf[2] = hex[(hashValue>>20)&0xf]
+	buf[3] = hex[(hashValue>>16)&0xf]
+	buf[4] = hex[(hashValue>>12)&0xf]
+	buf[5] = hex[(hashValue>>8)&0xf]
+	buf[6] = hex[(hashValue>>4)&0xf]
+	buf[7] = hex[hashValue&0xf]
+	return string(buf[:])
 }
 
-func simpleSandbox(ns string) *sandboxv1alpha1.Sandbox {
-	sandboxObj := &sandboxv1alpha1.Sandbox{}
+func simpleSandbox(ns string) *sandboxv1beta1.Sandbox {
+	sandboxObj := &sandboxv1beta1.Sandbox{}
 	sandboxObj.Name = "my-sandbox"
 	sandboxObj.Namespace = ns
 	sandboxObj.Spec.Service = new(true)
-	sandboxObj.Spec.PodTemplate = sandboxv1alpha1.PodTemplate{
+	sandboxObj.Spec.PodTemplate = sandboxv1beta1.PodTemplate{
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
 				{ // Use a simple pause container as a basic test
@@ -54,7 +65,7 @@ func simpleSandbox(ns string) *sandboxv1alpha1.Sandbox {
 				},
 			},
 		},
-		ObjectMeta: sandboxv1alpha1.PodMetadata{
+		ObjectMeta: sandboxv1beta1.PodMetadata{
 			Annotations: map[string]string{"test-anno-key": "val-1"},
 			Labels:      map[string]string{"test-label-key": "val-2"},
 		},
@@ -76,18 +87,30 @@ func TestSimpleSandbox(t *testing.T) {
 	nameHash := NameHash(sandboxObj.Name)
 	// Assert Sandbox object status reconciles as expected
 	p := []predicates.ObjectPredicate{
-		predicates.SandboxHasStatus(sandboxv1alpha1.SandboxStatus{
+		predicates.SandboxHasStatus(sandboxv1beta1.SandboxStatus{
 			Service:       "my-sandbox",
 			ServiceFQDN:   fmt.Sprintf("my-sandbox.%s.svc.cluster.local", ns.Name),
-			Replicas:      1,
 			LabelSelector: "agents.x-k8s.io/sandbox-name-hash=" + nameHash,
 			Conditions: []metav1.Condition{
 				{
-					Message:            "Pod is Ready; Service Exists",
+					Type:               string(sandboxv1beta1.SandboxConditionSuspended),
+					Status:             metav1.ConditionFalse,
 					ObservedGeneration: 1,
-					Reason:             "DependenciesReady",
-					Status:             "True",
+					Reason:             sandboxv1beta1.SandboxReasonNotSuspended,
+					Message:            "Sandbox is not suspended",
+				},
+				{
+					Type:               string(sandboxv1beta1.SandboxConditionPodScheduled),
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: 1,
+					Reason:             sandboxv1beta1.SandboxReasonPodScheduled,
+				},
+				{
 					Type:               "Ready",
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: 1,
+					Reason:             sandboxv1beta1.SandboxReasonDependenciesReady,
+					Message:            "Pod is Ready; Service Exists",
 				},
 			},
 		}),
@@ -99,7 +122,7 @@ func TestSimpleSandbox(t *testing.T) {
 		predicates.HasLabel("test-label-key", "val-2"),
 		predicates.HasOwnerReferences([]metav1.OwnerReference{
 			{
-				APIVersion:         "agents.x-k8s.io/v1alpha1",
+				APIVersion:         "agents.x-k8s.io/v1beta1",
 				BlockOwnerDeletion: new(true),
 				Controller:         new(true),
 				Kind:               "Sandbox",
@@ -116,7 +139,7 @@ func TestSimpleSandbox(t *testing.T) {
 	p = []predicates.ObjectPredicate{
 		predicates.HasOwnerReferences([]metav1.OwnerReference{
 			{
-				APIVersion:         "agents.x-k8s.io/v1alpha1",
+				APIVersion:         "agents.x-k8s.io/v1beta1",
 				BlockOwnerDeletion: new(true),
 				Controller:         new(true),
 				Kind:               "Sandbox",
@@ -129,4 +152,47 @@ func TestSimpleSandbox(t *testing.T) {
 	service.Name = "my-sandbox"
 	service.Namespace = ns.Name
 	tc.MustMatchPredicates(service, p...)
+}
+
+func TestSandboxServiceNameValidation(t *testing.T) {
+	tc := framework.NewTestContext(t)
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("sandbox-name-validation-%d", time.Now().UnixNano())}}
+	require.NoError(t, tc.CreateWithCleanup(t.Context(), ns))
+
+	newSandbox := func(name string, service *bool) *sandboxv1beta1.Sandbox {
+		return &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns.Name},
+			Spec: sandboxv1beta1.SandboxSpec{SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				Service: service,
+				PodTemplate: sandboxv1beta1.PodTemplate{Spec: corev1.PodSpec{Containers: []corev1.Container{{
+					Name:  "pause",
+					Image: "registry.k8s.io/pause:3.10",
+				}}}},
+			}},
+		}
+	}
+
+	t.Run("63 characters with service succeeds", func(t *testing.T) {
+		err := tc.CreateWithCleanup(t.Context(), newSandbox(strings.Repeat("a", 63), new(true)))
+		require.NoError(t, err)
+	})
+
+	t.Run("64 characters with service is rejected", func(t *testing.T) {
+		err := tc.CreateWithCleanup(t.Context(), newSandbox(strings.Repeat("b", 64), new(true)))
+		require.ErrorContains(t, err, "metadata.name must not exceed 63 characters when spec.service is true")
+	})
+
+	t.Run("64 characters without service succeeds but enabling service is rejected", func(t *testing.T) {
+		sandbox := newSandbox(strings.Repeat("c", 64), new(false))
+		require.NoError(t, tc.CreateWithCleanup(t.Context(), sandbox))
+
+		sandbox.Spec.Service = new(true)
+		err := tc.Update(t.Context(), sandbox)
+		require.ErrorContains(t, err, "metadata.name must not exceed 63 characters when spec.service is true")
+	})
+
+	t.Run("64 characters with service unset succeeds", func(t *testing.T) {
+		err := tc.CreateWithCleanup(t.Context(), newSandbox(strings.Repeat("d", 64), nil))
+		require.NoError(t, err)
+	})
 }

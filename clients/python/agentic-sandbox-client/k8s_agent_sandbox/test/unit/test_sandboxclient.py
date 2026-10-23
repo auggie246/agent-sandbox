@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
 import json
+import subprocess
+import sys
 import threading
 import unittest
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
 from unittest.mock import MagicMock, patch, ANY
 
 from requests.adapters import HTTPAdapter
@@ -26,15 +30,19 @@ from urllib3.util.retry import Retry
 from kubernetes import config as k8s_config
 from k8s_agent_sandbox.sandbox_client import SandboxClient
 from k8s_agent_sandbox.connector import SandboxConnector
+from k8s_agent_sandbox.models import AdditionalPodMetadata
+from k8s_agent_sandbox.pod_metadata import validate_labels
 from k8s_agent_sandbox.models import (
     SandboxDirectConnectionConfig,
     SandboxInClusterConnectionConfig,
     SandboxLocalTunnelConnectionConfig,
+    SandboxdInClusterConnectionConfig,
 )
-from k8s_agent_sandbox.constants import POD_NAME_ANNOTATION
 from k8s_agent_sandbox.exceptions import (
     SandboxPortForwardError,
     SandboxRequestError,
+    SandboxNotFoundError,
+    SandboxMetadataError,
 )
 from k8s_agent_sandbox.k8s_helper import K8sHelper
 
@@ -48,25 +56,43 @@ class TestSandboxClient(unittest.TestCase):
         self.mock_sandbox_class = MagicMock()
         self.client.sandbox_class = self.mock_sandbox_class
 
+    @patch('k8s_agent_sandbox.sandbox_client.K8sHelper')
+    def test_api_client_forwarded_to_k8s_helper(self, MockK8sHelper):
+        sentinel = MagicMock(name="ApiClient")
+        SandboxClient(api_client=sentinel)
+        MockK8sHelper.assert_called_once_with(api_client=sentinel)
+
     @patch('uuid.uuid4')
     def test_create_sandbox_success(self, mock_uuid):
         mock_uuid.return_value.hex = '1234abcd'
-        self.mock_k8s_helper.resolve_sandbox_name.return_value = "resolved-id"
-        self.mock_k8s_helper.get_sandbox.return_value = {
-            "metadata": {"annotations": {POD_NAME_ANNOTATION: "custom-pod-name"}}
-        }
-        
+        self.mock_k8s_helper.wait_for_claim_ready.return_value = "resolved-id"
+
         mock_sandbox_instance = MagicMock()
         self.mock_sandbox_class.return_value = mock_sandbox_instance
-        
-        with patch.object(self.client, '_create_claim') as mock_create_claim, \
-             patch.object(self.client, '_wait_for_sandbox_ready') as mock_wait:
-            
-            sandbox = self.client.create_sandbox("test-template", "test-namespace")
-            
-            mock_create_claim.assert_called_once_with("sandbox-claim-1234abcd", "test-template", "test-namespace", labels=None, lifecycle=None, warmpool=None)
-            self.mock_k8s_helper.resolve_sandbox_name.assert_called_once_with("sandbox-claim-1234abcd", "test-namespace", 180)
-            mock_wait.assert_called_once_with("resolved-id", "test-namespace", ANY)
+
+        with patch.object(self.client, '_create_claim') as mock_create_claim:
+            # The create response's resourceVersion seeds the ready-wait
+            # watch so it is served from the apiserver watch cache.
+            mock_create_claim.return_value = {"metadata": {"resourceVersion": "12345"}}
+
+            sandbox = self.client.create_sandbox("test-warmpool", "test-namespace")
+
+            mock_create_claim.assert_called_once_with(
+                "sandbox-claim-1234abcd",
+                "test-warmpool",
+                "test-namespace",
+                labels=None,
+                lifecycle=None,
+                volume_claim_templates=None,
+                pod_metadata=None,
+                env=None,
+            )
+            # A single claim watch resolves the sandbox name AND readiness;
+            # no separate wait on the Sandbox resource. The watch starts at
+            # the created claim's resourceVersion.
+            self.mock_k8s_helper.wait_for_claim_ready.assert_called_once_with(
+                "sandbox-claim-1234abcd", "test-namespace", 180, resource_version="12345")
+            self.mock_k8s_helper.wait_for_sandbox_ready.assert_not_called()
             self.assertEqual(sandbox, mock_sandbox_instance)
             
             # Verify the new sandbox is tracked in the registry
@@ -76,11 +102,11 @@ class TestSandboxClient(unittest.TestCase):
     @patch('uuid.uuid4')
     def test_create_sandbox_failure_cleanup(self, mock_uuid):
         mock_uuid.return_value.hex = '1234abcd'
-        self.mock_k8s_helper.resolve_sandbox_name.side_effect = Exception("Timeout Error")
-        
+        self.mock_k8s_helper.wait_for_claim_ready.side_effect = Exception("Timeout Error")
+
         with patch.object(self.client, '_create_claim') as mock_create_claim:
             with self.assertRaises(Exception) as context:
-                self.client.create_sandbox("test-template", "test-namespace")
+                self.client.create_sandbox("test-warmpool", "test-namespace")
                 
             self.assertEqual(str(context.exception), "Timeout Error")
             # Ensure delete_sandbox_claim is called to cleanup orphan claim on failure
@@ -153,7 +179,7 @@ class TestSandboxClient(unittest.TestCase):
         
         result = self.client.list_all_sandboxes("test-namespace")
         
-        self.mock_k8s_helper.list_sandbox_claims.assert_called_once_with("test-namespace")
+        self.mock_k8s_helper.list_sandbox_claims.assert_called_once_with("test-namespace", label_selector=None)
         self.assertEqual(result, ["sandbox-1", "sandbox-2"])
 
     def test_delete_sandbox_in_registry(self):
@@ -187,6 +213,44 @@ class TestSandboxClient(unittest.TestCase):
             mock_delete.assert_any_call("claim1", namespace="ns1")
             mock_delete.assert_any_call("claim2", namespace="ns2")
 
+    def _track_sandboxes(self):
+        automatic = MagicMock()
+        explicit = MagicMock()
+        self.client._active_connection_sandboxes[("ns", "auto")] = automatic
+        self.client._active_connection_sandboxes[("ns", "named")] = explicit
+        self.client._explicit_claims.add(("ns", "named"))
+        return automatic, explicit
+
+    def test_context_manager_cleans_up_on_exit(self):
+        automatic, explicit = self._track_sandboxes()
+
+        with self.client as c:
+            self.assertIs(c, self.client)
+            automatic.terminate.assert_not_called()
+
+        automatic.terminate.assert_called_once()
+        # Caller-owned claims keep their Claim and only lose the connection.
+        explicit.terminate.assert_not_called()
+        explicit.close_connection.assert_called_once()
+
+    def test_context_manager_cleans_up_on_exception(self):
+        automatic, _ = self._track_sandboxes()
+
+        with self.assertRaises(RuntimeError):
+            with self.client:
+                raise RuntimeError("boom")
+
+        automatic.terminate.assert_called_once()
+
+    def test_context_manager_deletes_attached_claim(self):
+        self.mock_k8s_helper.resolve_sandbox_name.return_value = "resolved-id"
+        self.mock_k8s_helper.get_sandbox.return_value = {"metadata": {}}
+
+        with self.client:
+            attached = self.client.get_sandbox("claim", "ns")
+
+        attached.terminate.assert_called_once()
+
     @patch('uuid.uuid4')
     def test_create_sandbox_with_labels(self, mock_uuid):
         mock_uuid.return_value.hex = '1234abcd'
@@ -200,71 +264,180 @@ class TestSandboxClient(unittest.TestCase):
         with patch.object(self.client, '_create_claim') as mock_create_claim, \
              patch.object(self.client, '_wait_for_sandbox_ready'):
 
-            self.client.create_sandbox("test-template", "test-namespace", labels=labels)
+            self.client.create_sandbox("test-warmpool", "test-namespace", labels=labels)
 
             mock_create_claim.assert_called_once_with(
-                "sandbox-claim-1234abcd", "test-template", "test-namespace",
+                "sandbox-claim-1234abcd", "test-warmpool", "test-namespace",
                 labels={"agent": "code-agent", "team": "platform"},
                 lifecycle=None,
-                warmpool=None,
+                volume_claim_templates=None,
+                pod_metadata=None,
+                env=None,
             )
+
+    @patch('uuid.uuid4')
+    def test_create_sandbox_with_pod_metadata(self, mock_uuid):
+        mock_uuid.return_value.hex = '1234abcd'
+        self.mock_k8s_helper.resolve_sandbox_name.return_value = "resolved-id"
+
+        mock_sandbox_instance = MagicMock()
+        self.mock_sandbox_class.return_value = mock_sandbox_instance
+
+        with patch.object(self.client, '_create_claim') as mock_create_claim, \
+             patch.object(self.client, '_wait_for_sandbox_ready'):
+
+            self.client.create_sandbox(
+                "test-warmpool", "test-namespace",
+                pod_labels={"client-id": "tenant-a"},
+                pod_annotations={"note": "owned-by-tenant-a"},
+            )
+
+            mock_create_claim.assert_called_once_with(
+                "sandbox-claim-1234abcd", "test-warmpool", "test-namespace",
+                labels=None,
+                lifecycle=None,
+                volume_claim_templates=None,
+                pod_metadata=AdditionalPodMetadata(
+                    labels={"client-id": "tenant-a"},
+                    annotations={"note": "owned-by-tenant-a"},
+                ),
+                env=None,
+            )
+
+    def test_create_sandbox_rejects_invalid_pod_label(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.client.create_sandbox("test-warmpool", pod_labels={"bad key!": "value"})
+        self.assertIn("invalid characters", str(ctx.exception))
+
+    @patch('uuid.uuid4')
+    def test_create_sandbox_with_volume_claim_templates(self, mock_uuid):
+        mock_uuid.return_value.hex = '1234abcd'
+        self.mock_k8s_helper.resolve_sandbox_name.return_value = "resolved-id"
+
+        mock_sandbox_instance = MagicMock()
+        self.mock_sandbox_class.return_value = mock_sandbox_instance
+
+        vcts = [{"metadata": {"name": "data"}, "spec": {"resources": {"requests": {"storage": "10Gi"}}}}]
+
+        with patch.object(self.client, '_create_claim') as mock_create_claim, \
+             patch.object(self.client, '_wait_for_sandbox_ready'):
+
+            self.client.create_sandbox(
+                "test-warmpool",
+                "test-namespace",
+                volume_claim_templates=vcts,
+            )
+
+            mock_create_claim.assert_called_once_with(
+                "sandbox-claim-1234abcd", "test-warmpool", "test-namespace",
+                labels=None,
+                lifecycle=None,
+                volume_claim_templates=vcts,
+                pod_metadata=None,
+                env=None,
+            )
+
+    def test_create_claim_with_volume_claim_templates(self):
+        self.client.tracing_manager = MagicMock()
+        self.client.tracing_manager.get_trace_context_json.return_value = "trace-data"
+
+        vcts = [{"metadata": {"name": "data"}, "spec": {"resources": {"requests": {"storage": "10Gi"}}}}]
+        self.client._create_claim(
+            "test-claim",
+            "test-warmpool",
+            "test-namespace",
+            volume_claim_templates=vcts,
+        )
+
+        self.mock_k8s_helper.create_sandbox_claim.assert_called_once_with(
+            "test-claim", "test-warmpool", "test-namespace",
+            annotations={"opentelemetry.io/trace-context": "trace-data"},
+            labels=None,
+            lifecycle=None,
+            volume_claim_templates=vcts,
+            pod_metadata=None,
+            env=None,
+        )
 
     def test_create_claim_with_labels(self):
         self.client.tracing_manager = MagicMock()
         self.client.tracing_manager.get_trace_context_json.return_value = "trace-data"
 
         labels = {"agent": "code-agent"}
-        self.client._create_claim("test-claim", "test-template", "test-namespace", labels=labels)
+        self.client._create_claim("test-claim", "test-warmpool", "test-namespace", labels=labels)
 
         self.mock_k8s_helper.create_sandbox_claim.assert_called_once_with(
-            "test-claim", "test-template", "test-namespace",
+            "test-claim", "test-warmpool", "test-namespace",
             annotations={"opentelemetry.io/trace-context": "trace-data"},
             labels={"agent": "code-agent"},
             lifecycle=None,
-            warmpool=None,
+            volume_claim_templates=None,
+            pod_metadata=None,
+            env=None,
+        )
+
+    def test_create_claim_with_pod_metadata(self):
+        self.client.tracing_manager = MagicMock()
+        self.client.tracing_manager.get_trace_context_json.return_value = "trace-data"
+
+        pod_metadata = AdditionalPodMetadata(labels={"client-id": "tenant-a"})
+        self.client._create_claim(
+            "test-claim", "test-warmpool", "test-namespace", pod_metadata=pod_metadata
+        )
+
+        self.mock_k8s_helper.create_sandbox_claim.assert_called_once_with(
+            "test-claim", "test-warmpool", "test-namespace",
+            annotations={"opentelemetry.io/trace-context": "trace-data"},
+            labels=None,
+            lifecycle=None,
+            volume_claim_templates=None,
+            pod_metadata=AdditionalPodMetadata(labels={"client-id": "tenant-a"}),
+            env=None,
         )
 
     def test_create_claim(self):
         self.client.tracing_manager = MagicMock()
         self.client.tracing_manager.get_trace_context_json.return_value = "trace-data"
-        
-        self.client._create_claim("test-claim", "test-template", "test-namespace")
-        
+
+        self.client._create_claim("test-claim", "test-warmpool", "test-namespace")
+
         self.mock_k8s_helper.create_sandbox_claim.assert_called_once_with(
-            "test-claim", "test-template", "test-namespace",
+            "test-claim", "test-warmpool", "test-namespace",
             annotations={"opentelemetry.io/trace-context": "trace-data"},
             labels=None,
             lifecycle=None,
-            warmpool=None,
+            volume_claim_templates=None,
+            pod_metadata=None,
+            env=None,
         )
 
     def test_validate_labels_rejects_invalid_value(self):
         with self.assertRaises(ValueError) as ctx:
-            self.client.create_sandbox("test-template", labels={"agent": "invalid value!"})
+            self.client.create_sandbox("test-warmpool", labels={"agent": "invalid value!"})
         self.assertIn("invalid characters", str(ctx.exception))
 
     def test_validate_labels_rejects_too_long_value(self):
         with self.assertRaises(ValueError) as ctx:
-            self.client.create_sandbox("test-template", labels={"agent": "a" * 64})
+            self.client.create_sandbox("test-warmpool", labels={"agent": "a" * 64})
         self.assertIn("exceeds max length", str(ctx.exception))
 
     def test_validate_labels_rejects_empty_key(self):
         with self.assertRaises(ValueError) as ctx:
-            self.client.create_sandbox("test-template", labels={"": "value"})
+            self.client.create_sandbox("test-warmpool", labels={"": "value"})
         self.assertIn("Label key cannot be empty", str(ctx.exception))
 
     def test_validate_labels_rejects_invalid_key(self):
         with self.assertRaises(ValueError) as ctx:
-            self.client.create_sandbox("test-template", labels={"bad key!": "value"})
+            self.client.create_sandbox("test-warmpool", labels={"bad key!": "value"})
         self.assertIn("invalid characters", str(ctx.exception))
 
     def test_validate_labels_rejects_too_long_key(self):
         with self.assertRaises(ValueError) as ctx:
-            self.client.create_sandbox("test-template", labels={"a" * 64: "value"})
+            self.client.create_sandbox("test-warmpool", labels={"a" * 64: "value"})
         self.assertIn("exceeds max length", str(ctx.exception))
 
     def test_validate_labels_accepts_prefixed_key(self):
-        SandboxClient._validate_labels({"app.kubernetes.io/name": "my-app"})
+        validate_labels({"app.kubernetes.io/name": "my-app"})
 
     def test_validate_labels_rejects_invalid_prefix(self):
         with self.assertRaises(ValueError) as ctx:
@@ -272,13 +445,13 @@ class TestSandboxClient(unittest.TestCase):
         self.assertIn("valid DNS subdomain", str(ctx.exception))
 
     def test_validate_labels_accepts_single_char_prefix(self):
-        SandboxClient._validate_labels({"a/name": "value"})
+        validate_labels({"a/name": "value"})
 
     def test_validate_labels_accepts_empty_value(self):
-        SandboxClient._validate_labels({"key": ""})
+        validate_labels({"key": ""})
 
     def test_validate_labels_accepts_valid(self):
-        SandboxClient._validate_labels({"agent": "code-agent", "team": "platform-123"})
+        validate_labels({"agent": "code-agent", "team": "platform-123"})
 
     def test_wait_for_sandbox_ready(self):
         self.client._wait_for_sandbox_ready("sandbox-id", "test-namespace", 45)
@@ -299,7 +472,7 @@ class TestSandboxClient(unittest.TestCase):
              patch.object(self.client, '_wait_for_sandbox_ready'):
 
             self.client.create_sandbox(
-                "test-template", "test-namespace", shutdown_after_seconds=300
+                "test-warmpool", "test-namespace", shutdown_after_seconds=300
             )
 
             mock_create_claim.assert_called_once()
@@ -307,6 +480,32 @@ class TestSandboxClient(unittest.TestCase):
             self.assertIsNotNone(lifecycle)
             self.assertEqual(lifecycle["shutdownPolicy"], "Delete")
             self.assertIn("shutdownTime", lifecycle)
+
+    @patch('uuid.uuid4')
+    def test_create_sandbox_with_env(self, mock_uuid):
+        mock_uuid.return_value.hex = '1234abcd'
+        self.mock_k8s_helper.resolve_sandbox_name.return_value = "resolved-id"
+
+        mock_sandbox_instance = MagicMock()
+        self.mock_sandbox_class.return_value = mock_sandbox_instance
+
+        env = {"FOO": "bar", "DEBUG": "true"}
+
+        with patch.object(self.client, '_create_claim') as mock_create_claim, \
+             patch.object(self.client, '_wait_for_sandbox_ready'):
+
+            self.client.create_sandbox("test-warmpool", "test-namespace", env=env)
+
+            mock_create_claim.assert_called_once_with(
+                "sandbox-claim-1234abcd",
+                "test-warmpool",
+                "test-namespace",
+                labels=None,
+                lifecycle=None,
+                volume_claim_templates=None,
+                pod_metadata=None,
+                env=env,
+            )
 
     @patch('uuid.uuid4')
     def test_create_sandbox_without_shutdown_after_seconds(self, mock_uuid):
@@ -319,7 +518,7 @@ class TestSandboxClient(unittest.TestCase):
         with patch.object(self.client, '_create_claim') as mock_create_claim, \
              patch.object(self.client, '_wait_for_sandbox_ready'):
 
-            self.client.create_sandbox("test-template", "test-namespace")
+            self.client.create_sandbox("test-warmpool", "test-namespace")
 
             call_kwargs = mock_create_claim.call_args
             lifecycle = call_kwargs[1].get("lifecycle")
@@ -339,56 +538,94 @@ class TestSandboxClient(unittest.TestCase):
             "shutdownPolicy": "Delete",
         }
         self.client._create_claim(
-            "test-claim", "test-template", "test-namespace", lifecycle=lifecycle
+            "test-claim", "test-warmpool", "test-namespace", lifecycle=lifecycle
         )
 
         self.mock_k8s_helper.create_sandbox_claim.assert_called_once_with(
-            "test-claim", "test-template", "test-namespace",
+            "test-claim", "test-warmpool", "test-namespace",
             annotations={},
             labels=None,
             lifecycle=lifecycle,
-            warmpool=None,
+            volume_claim_templates=None,
+            pod_metadata=None,
+            env=None,
         )
 
     def test_create_claim_without_lifecycle(self):
         self.client.tracing_manager = MagicMock()
         self.client.tracing_manager.get_trace_context_json.return_value = None
 
-        self.client._create_claim("test-claim", "test-template", "test-namespace")
+        self.client._create_claim("test-claim", "test-warmpool", "test-namespace")
 
         self.mock_k8s_helper.create_sandbox_claim.assert_called_once_with(
-            "test-claim", "test-template", "test-namespace",
+            "test-claim", "test-warmpool", "test-namespace",
             annotations={},
             labels=None,
             lifecycle=None,
-            warmpool=None,
+            volume_claim_templates=None,
+            pod_metadata=None,
+            env=None,
+        )
+
+    def test_create_claim_with_env(self):
+        self.client.tracing_manager = MagicMock()
+        self.client.tracing_manager.get_trace_context_json.return_value = None
+
+        env = {"FOO": "bar"}
+        self.client._create_claim("test-claim", "test-warmpool", "test-namespace", env=env)
+
+        self.mock_k8s_helper.create_sandbox_claim.assert_called_once_with(
+            "test-claim", "test-warmpool", "test-namespace",
+            annotations={},
+            labels=None,
+            lifecycle=None,
+            volume_claim_templates=None,
+            pod_metadata=None,
+            env=env,
         )
 
     def test_shutdown_after_seconds_validation_zero(self):
         with self.assertRaises(ValueError) as ctx:
-            self.client.create_sandbox("test-template", shutdown_after_seconds=0)
+            self.client.create_sandbox("test-warmpool", shutdown_after_seconds=0)
         self.assertIn("positive", str(ctx.exception))
 
     def test_shutdown_after_seconds_validation_negative(self):
         with self.assertRaises(ValueError) as ctx:
-            self.client.create_sandbox("test-template", shutdown_after_seconds=-1)
+            self.client.create_sandbox("test-warmpool", shutdown_after_seconds=-1)
         self.assertIn("positive", str(ctx.exception))
 
     def test_shutdown_after_seconds_validation_bool(self):
         with self.assertRaises(ValueError) as ctx:
-            self.client.create_sandbox("test-template", shutdown_after_seconds=True)
+            self.client.create_sandbox("test-warmpool", shutdown_after_seconds=True)
         self.assertIn("integer", str(ctx.exception))
 
     def test_shutdown_after_seconds_validation_float(self):
         with self.assertRaises(ValueError) as ctx:
-            self.client.create_sandbox("test-template", shutdown_after_seconds=1.5)
+            self.client.create_sandbox("test-warmpool", shutdown_after_seconds=1.5)
         self.assertIn("integer", str(ctx.exception))
 
     def test_shutdown_after_seconds_validation_string(self):
         with self.assertRaises(ValueError) as ctx:
-            self.client.create_sandbox("test-template", shutdown_after_seconds="10")
+            self.client.create_sandbox("test-warmpool", shutdown_after_seconds="10")
         self.assertIn("integer", str(ctx.exception))
 
+    def test_get_sandbox_claim_warmpool_name(self):
+        self.mock_k8s_helper.get_sandbox_claim.return_value = {
+            "spec": {"warmPoolRef": {"name": "my-warmpool"}},
+        }
+        warmpool_name = self.client.get_sandbox_claim_warmpool_name("my-claim", "my-namespace")
+        self.assertEqual(warmpool_name, "my-warmpool")
+
+    def test_get_sandbox_claim_warmpool_name_claim_not_found(self):
+        self.mock_k8s_helper.get_sandbox_claim.return_value = None
+        with self.assertRaises(SandboxNotFoundError):
+            self.client.get_sandbox_claim_warmpool_name("my-claim", "my-namespace")
+
+
+    def test_get_sandbox_claim_warmpool_name_missing_warmpool_ref(self):
+        self.mock_k8s_helper.get_sandbox_claim.return_value = {"spec": {}}
+        with self.assertRaises(SandboxMetadataError):
+            self.client.get_sandbox_claim_warmpool_name("my-claim", "my-namespace")
 
 class SandboxHandler(BaseHTTPRequestHandler):
     """Minimal api handler with basic routing to exercise error paths."""
@@ -425,6 +662,9 @@ class SandboxHandler(BaseHTTPRequestHandler):
 
 class TestRequestExceptions(unittest.TestCase):
     """Integration tests: real HTTP server + SandboxConnector.send_request()."""
+    port: int
+    server: HTTPServer
+    server_thread: threading.Thread
 
     @classmethod
     def setUpClass(cls):
@@ -548,7 +788,7 @@ class TestK8sHelperWatchNoneEvents(unittest.TestCase):
 
     @patch("k8s_agent_sandbox.k8s_helper.watch.Watch")
     def test_wait_for_sandbox_ready_returns_pod_ip(self, mock_watch_cls):
-        """wait_for_sandbox_ready returns the first pod IP when present."""
+        """wait_for_sandbox_ready returns the prioritized and normalized pod IP when present."""
         mock_watch = MagicMock()
         mock_watch_cls.return_value = mock_watch
         mock_watch.stream.return_value = [{
@@ -556,7 +796,7 @@ class TestK8sHelperWatchNoneEvents(unittest.TestCase):
             "object": {
                 "status": {
                     "conditions": [{"type": "Ready", "status": "True"}],
-                    "podIPs": ["10.244.0.5", "fd00::5"],
+                    "podIPs": ["::ffff:10.244.0.5", "fd00::5"],
                 },
             },
         }]
@@ -640,6 +880,12 @@ class TestSandboxClientInClusterConfig(unittest.TestCase):
         self.assertIsInstance(sc.connection_config, SandboxInClusterConnectionConfig)
 
     @patch('k8s_agent_sandbox.sandbox_client.K8sHelper')
+    def test_sandboxd_in_cluster_config_stored(self, _):
+        config = SandboxdInClusterConnectionConfig(mode="in-cluster-service")
+        client = SandboxClient(connection_config=config)
+        self.assertIs(client.connection_config, config)
+
+    @patch('k8s_agent_sandbox.sandbox_client.K8sHelper')
     def test_default_config_is_local_tunnel(self, _):
         sc = SandboxClient()
         self.assertIsInstance(sc.connection_config, SandboxLocalTunnelConnectionConfig)
@@ -682,6 +928,62 @@ class TestSandboxClientInClusterConfig(unittest.TestCase):
         """SandboxClient no longer threads pod_ip — Sandbox resolves it internally."""
         call_kwargs = self._create_sandbox_with_in_cluster_config()
         self.assertNotIn('pod_ip', call_kwargs)
+
+
+from pydantic import ValidationError
+
+class TestConnectionConfigValidation(unittest.TestCase):
+    def test_valid_router_namespace(self):
+        valid_namespaces = ["default", "agent-sandbox-system", "my-namespace-123", "kube-system"]
+        for ns in valid_namespaces:
+            config = SandboxLocalTunnelConnectionConfig(router_namespace=ns)
+            self.assertEqual(config.router_namespace, ns)
+
+    def test_invalid_router_namespace(self):
+        invalid_namespaces = [
+            "-invalid",        # starts with hyphen
+            "invalid-",        # ends with hyphen
+            "Uppercase",       # contains uppercase letters
+            "ns_with_under",   # contains underscore
+            "ns;echo",         # command injection attempt
+            "ns|sh",           # pipe attempt
+            "ns&rm",           # ampersand attempt
+            "",                # empty namespace
+        ]
+        for ns in invalid_namespaces:
+            with self.assertRaises(ValidationError):
+                SandboxLocalTunnelConnectionConfig(router_namespace=ns)
+
+
+class TestLibraryLogging(unittest.TestCase):
+    """The SDK must leave root logger configuration to the application."""
+
+    def test_import_leaves_root_logger_unconfigured(self):
+        # Fresh interpreter: pytest itself installs root handlers in-process.
+        code = (
+            "import logging, k8s_agent_sandbox.sandbox_client\n"
+            "root = logging.getLogger()\n"
+            "assert not root.handlers, root.handlers\n"
+            "assert root.level == logging.WARNING, root.level\n"
+        )
+        subprocess.run([sys.executable, "-c", code], check=True)
+
+    def test_no_root_logger_calls(self):
+        # logging.info() and friends call basicConfig() on a bare root logger.
+        root_calls = {"debug", "info", "warning", "error", "exception", "critical", "log"}
+        package_dir = Path(__file__).resolve().parents[2]
+        offenders = []
+        for path in package_dir.rglob("*.py"):
+            if "test" in path.relative_to(package_dir).parts:
+                continue
+            for node in ast.walk(ast.parse(path.read_text())):
+                if (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "logging"
+                        and node.func.attr in root_calls):
+                    offenders.append(f"{path.name}:{node.lineno}")
+        self.assertEqual(offenders, [])
 
 
 if __name__ == '__main__':

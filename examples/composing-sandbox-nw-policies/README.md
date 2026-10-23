@@ -26,7 +26,9 @@ This composition can be achieved in multiple ways:
 
 This example demonstrates the second approach, using KRO to define a new `AgenticSandbox` CRD that encapsulates a `Sandbox`, a `NetworkPolicy`, and a `Service`.
 
-The `Service` created here is distinct from the one created by the `agent-sandbox` controller. This layering allows for more complex networking configurations and showcases the value of composing resources.
+> **Note:** KRO serves a single schema version per RGD. If you previously applied an older revision of this example (which declared `v1alpha1`), delete the old RGD and any `AgenticSandbox` instances first (`kubectl delete agenticsandbox --all && kubectl delete rgd agentic-sandbox`), then apply this one and recreate your instances at `v1beta1`.
+
+The controller only creates its own headless `Service` when the Sandbox sets `spec.service: true`; this example leaves it unset, so the `Service` defined here is the only one. This layering allows for more complex networking configurations and showcases the value of composing resources.
 
 ## Brief introduction to KRO
 
@@ -68,7 +70,7 @@ Validate that the RGD is installed correctly:
 ```
 $ kubectl get rgd
 NAME              APIVERSION   KIND             STATE    AGE
-agentic-sandbox   v1alpha1     AgenticSandbox   Active   6m38s
+agentic-sandbox   v1beta1     AgenticSandbox   Active   6m38s
 ```
 
 Validate that the new `AgenticSandbox` CRD is installed correctly:
@@ -85,7 +87,7 @@ sandboxes.agents.x-k8s.io                 2025-09-19T22:40:05Z
 You can now create an example `AgenticSandbox` resource:
 
 ```yaml
-apiVersion: custom.agents.x-k8s.io/v1alpha1
+apiVersion: custom.agents.x-k8s.io/v1beta1
 kind: AgenticSandbox
 metadata:
   name: demo
@@ -111,7 +113,7 @@ The KRO reconciler reconciles `AgenticSandbox` instance and creates the followin
 * Sandbox
 * Service
 * NetworkPolicy (if enabled)
-* Ingress (if enbled)
+* Ingress (if enabled)
 
 The user/agent can access the Sandbox via the Ingress or the Service as appropriate.
 

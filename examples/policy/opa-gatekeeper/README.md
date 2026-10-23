@@ -65,7 +65,7 @@ Apply the template:
 kubectl apply -f template-sandbox-binding.yaml
 ```
 
-This creates a new CRD called `K8sPreventSandboxServiceAccountBinding` that Gatekeeper will recognize. You can verify it by running the following:
+This creates a new CRD called `K8sPreventActiveServiceAccountBinding` that Gatekeeper will recognize. You can verify it by running the following:
 
 ```bash
 kubectl get crd k8spreventactiveserviceaccountbinding
@@ -123,7 +123,7 @@ metadata:
   name: sandbox-sa
   namespace: sandbox-ns
 ---
-apiVersion: agents.x-k8s.io/v1alpha1
+apiVersion: agents.x-k8s.io/v1beta1
 kind: Sandbox
 metadata:
   name: sandbox-example
